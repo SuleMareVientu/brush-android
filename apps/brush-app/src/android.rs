@@ -1,7 +1,8 @@
+use crate::shared::startup;
+use brush_ui::app::App;
+use brush_ui::ui_process::UiProcess;
 use std::os::raw::c_void;
 use std::sync::Arc;
-
-use crate::ui::app::App;
 
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
@@ -13,7 +14,9 @@ pub extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _: *mut c_void) -> jni::sys::
 
 #[unsafe(no_mangle)]
 fn android_main(app: winit::platform::android::activity::AndroidApp) {
-    let wgpu_options = crate::ui::create_egui_options();
+    let wgpu_options = brush_ui::create_egui_options();
+
+    startup();
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

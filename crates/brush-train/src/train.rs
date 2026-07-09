@@ -125,7 +125,7 @@ impl SplatTrainer {
         config.sh_warmup_iter = config.sh_warmup_iter.min(config.warmup_iter / 2);
         config.growth_stop_iter = config.growth_stop_iter.min(config.total_train_iters);
 
-        let decay_steps = config.total_train_iters.saturating_sub(config.warmup_iter).max(1);
+        let decay_steps = config.total_train_iters;
         let decay =
             (config.lr_mean_end / config.lr_mean).powf(1.0 / decay_steps as f64);
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);

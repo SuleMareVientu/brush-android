@@ -219,12 +219,14 @@ pub async fn render_splats(
     camera: &Camera,
     img_size: glam::UVec2,
     background: Vec3,
+    cov_blur: Option<f32>,
 ) -> SplatOutputDiff {
     render_splats_with_pass(
         splats,
         camera,
         img_size,
         background,
+        cov_blur,
         brush_render::gaussian_splats::RasterPass::Backward,
     )
     .await
@@ -239,6 +241,7 @@ pub async fn render_splats_with_pass(
     camera: &Camera,
     img_size: glam::UVec2,
     background: Vec3,
+    cov_blur: Option<f32>,
     pass: brush_render::gaussian_splats::RasterPass,
 ) -> SplatOutputDiff {
     splats.clone().validate_values().await;
@@ -300,6 +303,7 @@ pub async fn render_splats_with_pass(
         raw_opac_inner.clone(),
         render_mode,
         background,
+        cov_blur,
         pass,
     )
     .await;

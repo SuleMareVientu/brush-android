@@ -13,7 +13,7 @@ use tracing::trace_span;
 
 #[derive(Config, Debug)]
 pub struct RandomSplatsConfig {
-    #[config(default = 10000)]
+    #[config(default = 10)]
     pub init_count: usize,
 }
 
@@ -21,6 +21,7 @@ pub struct RandomSplatsConfig {
 ///
 /// Uses the average nearest-neighbor distance between cameras,
 /// with a minimum of 1.0 (1 meter baseline).
+#[allow(dead_code)]
 fn estimate_scene_scale(cameras: &[Camera]) -> f32 {
     if cameras.len() < 2 {
         return 1.0;
@@ -54,39 +55,43 @@ fn estimate_scene_scale(cameras: &[Camera]) -> f32 {
 pub fn create_random_splats(
     config: &RandomSplatsConfig,
     cameras: &[Camera],
-    scene_scale_override: Option<f32>,
+    _scene_scale_override: Option<f32>,
     rng: &mut impl Rng,
     mode: SplatRenderMode,
     device: &Device,
 ) -> Splats {
     let num_points = config.init_count;
-    let scene_scale = scene_scale_override.unwrap_or_else(|| estimate_scene_scale(cameras));
 
-    let near = scene_scale * 0.05;
-    let far = scene_scale;
-    let ln_near = near.ln();
-    let ln_far = far.ln();
+    // SLV Initialization: bounds from camera positions
+    let mut min_pos = Vec3::splat(f32::INFINITY);
+    let mut max_pos = Vec3::splat(f32::NEG_INFINITY);
+    for cam in cameras {
+        min_pos = min_pos.min(cam.position);
+        max_pos = max_pos.max(cam.position);
+    }
+    
+    // If there are no cameras or only one, default to a 1x1x1 box
+    if min_pos.x == f32::INFINITY {
+        min_pos = Vec3::splat(-1.0);
+        max_pos = Vec3::splat(1.0);
+    } else if min_pos == max_pos {
+        min_pos -= Vec3::splat(1.0);
+        max_pos += Vec3::splat(1.0);
+    }
 
-    // Sample points in camera frustums
+    let camera_dist = max_pos - min_pos;
+    let bounds_extent = camera_dist.max_element();
+    // Large variance for low-frequency structure
+    let large_scale = (bounds_extent * 1.5).ln();
+
+    // Sample points in the camera bounding box
     let positions: Vec<f32> = (0..num_points)
         .flat_map(|_| {
-            let cam = &cameras[rng.random_range(0..cameras.len())];
-            let local_to_world = cam.local_to_world();
-
-            // Random direction within the camera's FOV
-            let half_fov_x = (cam.fov_x * 0.5) as f32;
-            let half_fov_y = (cam.fov_y * 0.5) as f32;
-            let dx = rng.random_range(-half_fov_x..half_fov_x).tan();
-            let dy = rng.random_range(-half_fov_y..half_fov_y).tan();
-
-            // Log-uniform depth so we don't over-pack near the camera
-            let depth = (rng.random_range(ln_near..ln_far)).exp();
-
-            // Camera looks along -Z in local space
-            let local_point = Vec3::new(dx * depth, dy * depth, -depth);
-            let world_point = local_to_world.transform_point3(local_point);
-
-            [world_point.x, world_point.y, world_point.z]
+            [
+                rng.random_range(min_pos.x..max_pos.x),
+                rng.random_range(min_pos.y..max_pos.y),
+                rng.random_range(min_pos.z..max_pos.z),
+            ]
         })
         .collect();
 
@@ -118,9 +123,8 @@ pub fn create_random_splats(
         .map(|_| rng.random_range(inverse_sigmoid(0.1)..inverse_sigmoid(0.25)))
         .collect();
 
-    // Scale based on scene scale and point density
-    let default_scale = (scene_scale / (num_points as f32).cbrt()).ln();
-    let log_scales: Vec<f32> = vec![default_scale; num_points * 3];
+    // SLV: Scale is initialized to a large variance
+    let log_scales: Vec<f32> = vec![large_scale; num_points * 3];
 
     Splats::from_raw(
         positions, rotations, log_scales, sh_coeffs, opacities, mode, device,

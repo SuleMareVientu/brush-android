@@ -12,6 +12,14 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options")]
     pub render_mode: Option<SplatRenderMode>,
 
+    /// Number of warmup iterations where low_pass filter and LR are adjusted.
+    #[arg(long, help_heading = "Training options", default_value = "10000")]
+    pub warmup_iter: u32,
+
+    /// Number of iterations before SH degree starts increasing.
+    #[arg(long, help_heading = "Training options", default_value = "5000")]
+    pub sh_warmup_iter: u32,
+
     /// Start learning rate for the mean parameters.
     #[arg(long, help_heading = "Training options", default_value = "2e-5")]
     pub lr_mean: f64,

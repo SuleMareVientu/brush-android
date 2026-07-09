@@ -174,8 +174,7 @@ pub fn calc_cov2d(
 /// passed-in cov2d and returns the new `Sym2` plus the compensation
 /// factor (1.0 when `mip_splatting=false`).
 #[cube]
-pub fn compensate_cov2d(c: Sym2, #[comptime] mip_splatting: bool) -> (Sym2, f32) {
-    let cov_blur = comptime![if mip_splatting { 0.1f32 } else { 0.3f32 }];
+pub fn compensate_cov2d(c: Sym2, cov_blur: f32, #[comptime] mip_splatting: bool) -> (Sym2, f32) {
     let blurred = Sym2 {
         c00: c.c00 + cov_blur,
         c01: c.c01,

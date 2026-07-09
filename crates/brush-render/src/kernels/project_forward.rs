@@ -80,7 +80,7 @@ pub fn project_forward_kernel(
     let quat = quat_unorm.normalize();
 
     let raw_cov = calc_cov2d(scale, quat, mean_c, u, camera_model);
-    let (cov, filter_comp) = compensate_cov2d(raw_cov, mip_splatting);
+    let (cov, filter_comp) = compensate_cov2d(raw_cov, u.cov_blur, mip_splatting);
     let opac = sigmoid(raw_opac) * filter_comp;
 
     if !cov.is_finite() {

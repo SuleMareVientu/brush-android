@@ -127,6 +127,7 @@ async fn test_reference() -> anyhow::Result<()> {
             glam::uvec2(w as u32, h as u32),
             glam::Vec3::ZERO,
             None,
+            None,
             TextureMode::Float,
         )
         .await;

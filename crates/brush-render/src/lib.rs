@@ -74,6 +74,7 @@ pub trait SplatOps: Backend {
         raw_opacities: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         background: Vec3,
+        cov_blur: Option<f32>,
         pass: gaussian_splats::RasterPass,
     ) -> impl Future<Output = RenderOutput<Self>>;
 }

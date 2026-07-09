@@ -47,7 +47,7 @@ pub fn project_visible_kernel(
 
     let mean_c = world_to_cam(mean, u);
     let raw_cov = calc_cov2d(scale, quat, mean_c, u, camera_model);
-    let (cov, filter_comp) = compensate_cov2d(raw_cov, mip_splatting);
+    let (cov, filter_comp) = compensate_cov2d(raw_cov, u.cov_blur, mip_splatting);
     let opac = sigmoid(raw_opacities[global_gid as usize]) * filter_comp;
     let conic = cov.inverse();
 

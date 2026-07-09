@@ -44,6 +44,7 @@ impl SplatOps for MainBackendBase {
         raw_opacities: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         background: Vec3,
+        cov_blur: Option<f32>,
         pass: RasterPass,
     ) -> RenderOutput<Self> {
         assert!(
@@ -86,6 +87,7 @@ impl SplatOps for MainBackendBase {
                 pinhole_params,
                 camera.camera_model,
             ),
+            cov_blur: cov_blur.unwrap_or(if render_mode == SplatRenderMode::Mip { 0.1 } else { 0.3 }),
         };
 
         let device = transforms.device.clone();

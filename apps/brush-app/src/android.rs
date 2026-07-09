@@ -1,6 +1,7 @@
-use crate::ui::app::App;
 use std::os::raw::c_void;
 use std::sync::Arc;
+
+use crate::ui::app::App;
 
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]

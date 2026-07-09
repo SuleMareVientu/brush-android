@@ -167,6 +167,7 @@ pub async fn run_forward_render(
             glam::uvec2(resolution.0, resolution.1),
             Vec3::ZERO,
             None,
+            None,
             TextureMode::Float,
         )
         .await;

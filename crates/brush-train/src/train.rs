@@ -13,7 +13,6 @@ use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, image_loss};
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
-use brush_render_bwd::render_splats;
 use burn::{
     backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     lr_scheduler::{
@@ -163,6 +162,42 @@ impl SplatTrainer {
         }
         self.step_count += 1;
 
+        // RAIN-GS: SH Degree Warmup
+        let expected_sh_degree = if self.step_count <= self.config.sh_warmup_iter {
+            0
+        } else {
+            ((self.step_count - self.config.sh_warmup_iter) / 1000).min(self.max_sh_degree)
+        };
+
+        if splats.sh_degree() != expected_sh_degree {
+            let new_coeffs = brush_render::sh::sh_coeffs_for_degree(expected_sh_degree) as usize;
+            let current_coeffs = brush_render::sh::sh_coeffs_for_degree(splats.sh_degree()) as usize;
+            
+            if expected_sh_degree < splats.sh_degree() {
+                // Truncate
+                let inner_tensor = splats.sh_coeffs.val().inner();
+                let sliced_inner = inner_tensor.slice(s![.., 0..new_coeffs, ..]);
+                let lifted = brush_render::burn_glue::lift_to_autodiff(sliced_inner);
+                splats.sh_coeffs = burn::module::Param::initialized(
+                    splats.sh_coeffs.id.clone(), 
+                    lifted.require_grad()
+                );
+                self.optim = None;
+            } else if expected_sh_degree > splats.sh_degree() {
+                // Pad with zeros
+                let opt_device = splats.device().inner();
+                let zeros = Tensor::zeros([splats.num_splats() as usize, new_coeffs - current_coeffs, 3], &opt_device);
+                let inner_tensor = splats.sh_coeffs.val().inner();
+                let new_sh_tensor = Tensor::cat(vec![inner_tensor, zeros], 1);
+                let lifted = brush_render::burn_glue::lift_to_autodiff(new_sh_tensor);
+                splats.sh_coeffs = burn::module::Param::initialized(
+                    splats.sh_coeffs.id.clone(), 
+                    lifted.require_grad()
+                );
+                self.optim = None;
+            }
+        }
+
         let [img_h, img_w] = batch.img_size();
         let camera = batch.camera;
 
@@ -188,7 +223,16 @@ impl SplatTrainer {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
             let render_input = splats.clone();
-            let diff_out = render_splats(render_input, &camera, img_size, background)
+            
+            let low_pass = if self.step_count <= self.config.warmup_iter {
+                let n_gaussians = splats.num_splats();
+                let lp = (img_h * img_w) as f32 / (n_gaussians as f32 * 9.0 * std::f32::consts::PI);
+                lp.clamp(0.3, 300.0)
+            } else {
+                0.3
+            };
+
+            let diff_out = brush_render_bwd::render_splats(render_input, &camera, img_size, background, Some(low_pass))
                 .instrument(trace_span!("Forward"))
                 .await;
 
@@ -308,7 +352,11 @@ impl SplatTrainer {
                 )]))
             });
 
-        let lr_mean = self.sched_mean.step() * median_scale as f64;
+        let lr_mean = if self.step_count <= self.config.warmup_iter {
+            self.config.lr_mean * median_scale as f64
+        } else {
+            self.sched_mean.step() * median_scale as f64
+        };
 
         // Update per-component LR scaling for the transforms param.
         // transforms layout: means(3) + rotations(4) + log_scales(3)
@@ -355,10 +403,15 @@ impl SplatTrainer {
                     GradientsParams::from_params(&mut grads, &splats, &[splats.sh_coeffs.id]);
                 optimizer.step(self.config.lr_coeffs_dc, splats, grad_coeff)
             });
+            let lr_opac = if self.step_count <= self.config.warmup_iter {
+                self.config.lr_opac * 2.0
+            } else {
+                self.config.lr_opac
+            };
             splats = trace_span!("Opacity step").in_scope(|| {
                 let grad_opac =
                     GradientsParams::from_params(&mut grads, &splats, &[splats.raw_opacities.id]);
-                optimizer.step(self.config.lr_opac, splats, grad_opac)
+                optimizer.step(lr_opac, splats, grad_opac)
             });
             splats
         });
@@ -638,7 +691,7 @@ impl SplatTrainer {
         (
             splats,
             RefineStats {
-                num_added: refine_count as u32,
+                num_added: if iter <= self.config.warmup_iter { 2 * refine_count } else { refine_count } as u32,
                 num_split_oversized,
                 num_split_high_grad,
                 num_pruned: pruned_count,
@@ -714,7 +767,18 @@ impl SplatTrainer {
             let offset_factor = (-k_per_axis.clone().powi_scalar(2) + 1.0)
                 .clamp_min(0.0)
                 .sqrt();
-            let offset_local = offset_factor * cur_scales;
+            let p_base = offset_factor * cur_scales;
+            
+            // ABE-Split constraints
+            let scene_extent = self.bounds.extent.max_element();
+            let p_len = p_base.clone().powi_scalar(2.0).sum_dim(1).sqrt().clamp_min(1e-6); // [refine_count, 1]
+            let p_norm = p_base.clone() / p_len.clone(); // [refine_count, 3]
+            
+            let threshold = scene_extent * 0.3;
+            let exceed_mask = p_len.greater_elem(threshold);
+            let exceed_f32 = exceed_mask.clone().int().float();
+            let keep_f32 = exceed_mask.bool_not().int().float();
+            let offset_local = p_norm * threshold * exceed_f32 + p_base * keep_f32;
             let samples = quaternion_vec_multiply(cur_rots.clone(), offset_local);
             let new_log_scales = cur_log_scale.clone() + k_per_axis.log();
             let child_rots = cur_rots;
@@ -722,7 +786,7 @@ impl SplatTrainer {
             // Scatter into transforms: build a [refine_count, 10] update tensor
             // with means offset in cols 0..3 and log_scales difference in cols 7..10
             let refine_inds_10 = refine_inds.clone().unsqueeze_dim(1).repeat_dim(1, 10);
-            let scale_difference = new_log_scales.clone() - cur_log_scale;
+            let scale_difference = new_log_scales.clone() - cur_log_scale.clone();
 
             splats.transforms = splats.transforms.map(|t| {
                 let dev = t.device();
@@ -738,11 +802,37 @@ impl SplatTrainer {
                 m.scatter(0, refine_inds.clone(), difference, IndexingUpdateOp::Add)
             });
 
-            // Child sits at parent_mean + samples (parent moves to
-            // parent_mean - samples) — anti-correlated, centroid-preserving.
-            // Build new transforms row: means(3) + rotations(4) + log_scales(3)
-            let new_transforms =
-                Tensor::cat(vec![cur_means + samples, child_rots, new_log_scales], 1);
+            // ABE-Split: during warmup, split into 3 children instead of 2.
+            let abe_split = iter <= self.config.warmup_iter;
+
+            let new_transforms_std = Tensor::cat(
+                vec![cur_means.clone() + samples.clone(), child_rots.clone(), new_log_scales.clone()],
+                1,
+            );
+            let mut sh_coeffs = cur_sh_coeffs.clone();
+
+            let (new_transforms, new_raw_opac, new_count) = if abe_split {
+                // μ' = 0.3 * s * normalize(μ - B0) + B0
+                let scene_center = self.bounds.center;
+                let bbox_center = Tensor::<1>::from_floats([scene_center.x, scene_center.y, scene_center.z], device)
+                    .reshape([1, 3]);
+                let scene_extent = self.bounds.extent.max_element();
+                
+                let offset = cur_means.clone() - bbox_center.clone();
+                let offset_len = offset.clone().powi_scalar(2.0).sum_dim(1).sqrt().clamp_min(1e-8);
+                let dir = offset / offset_len;
+                let new_xyz_abe = dir * 0.3 * scene_extent + bbox_center;
+                
+                // Retains parent's scale/rotation/opacity/SH.
+                let new_transforms_abe = Tensor::cat(vec![new_xyz_abe, child_rots.clone(), cur_log_scale.clone()], 1);
+                
+                let combined_transforms = Tensor::cat(vec![new_transforms_std, new_transforms_abe], 0);
+                let combined_raw_opac = Tensor::cat(vec![new_raw_opac.clone(), cur_raw_opac.clone()], 0);
+                sh_coeffs = Tensor::cat(vec![sh_coeffs.clone(), cur_sh_coeffs.clone()], 0);
+                (combined_transforms, combined_raw_opac, 2 * refine_count)
+            } else {
+                (new_transforms_std, new_raw_opac.clone(), refine_count)
+            };
 
             // Optimizer state lives on the inner (non-autodiff) device.
             let opt_device = device.clone().inner();
@@ -757,7 +847,7 @@ impl SplatTrainer {
                 splats,
                 &mut record,
                 |x| Tensor::cat(vec![x, new_transforms], 0),
-                |x| Tensor::cat(vec![x, cur_sh_coeffs], 0),
+                |x| Tensor::cat(vec![x, sh_coeffs], 0),
                 |x| Tensor::cat(vec![x, new_raw_opac], 0),
                 |x: Tensor<2>| {
                     let d1 = x.dims()[1];
@@ -765,7 +855,7 @@ impl SplatTrainer {
                     let inds: Tensor<2, Int> =
                         refine_inds_opt.clone().unsqueeze_dim(1).repeat_dim(1, d1);
                     let x = x.scatter(0, inds, neg_parent, IndexingUpdateOp::Add);
-                    Tensor::cat(vec![x, Tensor::zeros([refine_count, d1], &opt_device)], 0)
+                    Tensor::cat(vec![x, Tensor::zeros([new_count, d1], &opt_device)], 0)
                 },
                 |x: Tensor<3>| {
                     let [_, d1, d2] = x.dims();
@@ -775,7 +865,7 @@ impl SplatTrainer {
                     let inds: Tensor<3, Int> = inds_2.unsqueeze_dim(2).repeat_dim(2, d2);
                     let x = x.scatter(0, inds, neg_parent, IndexingUpdateOp::Add);
                     Tensor::cat(
-                        vec![x, Tensor::zeros([refine_count, d1, d2], &opt_device)],
+                        vec![x, Tensor::zeros([new_count, d1, d2], &opt_device)],
                         0,
                     )
                 },
@@ -787,7 +877,7 @@ impl SplatTrainer {
                         neg_parent,
                         IndexingUpdateOp::Add,
                     );
-                    Tensor::cat(vec![x, Tensor::zeros([refine_count], &opt_device)], 0)
+                    Tensor::cat(vec![x, Tensor::zeros([new_count], &opt_device)], 0)
                 },
             );
         }

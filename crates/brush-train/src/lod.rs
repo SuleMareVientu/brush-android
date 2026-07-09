@@ -1,7 +1,6 @@
 use brush_dataset::scene::{sample_to_packed_data, view_to_sample_image};
 use brush_loss::{ImageLossConfig, image_loss};
 use brush_render::gaussian_splats::Splats;
-use brush_render_bwd::render_splats;
 use burn::{
     prelude::Module,
     tensor::{Device, Int, Tensor, TensorData, s},
@@ -98,7 +97,7 @@ pub async fn compute_pup_scores(
         let mut splats: Splats = splats.clone().train();
         splats.transforms = splats.transforms.map(|t: Tensor<2>| t.require_grad());
 
-        let diff_out = render_splats(splats.clone(), &view.camera, img_size, Vec3::ZERO).await;
+        let diff_out = brush_render_bwd::render_splats(splats.clone(), &view.camera, img_size, Vec3::ZERO, None).await;
         let pred_rgb = diff_out.img.slice(s![.., .., 0..3]);
 
         let gt_packed: Tensor<2, Int> = Tensor::from_data(gt_data, device);

@@ -51,6 +51,7 @@ impl SplatBackbuffer {
                     req.state.img_size,
                     req.state.background,
                     req.state.splat_scale,
+                    None,
                     TextureMode::Packed,
                 )
                 .await;

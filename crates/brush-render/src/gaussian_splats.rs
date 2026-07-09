@@ -368,6 +368,7 @@ pub async fn render_splats(
     img_size: glam::UVec2,
     background: Vec3,
     splat_scale: Option<f32>,
+    cov_blur: Option<f32>,
     texture_mode: TextureMode,
 ) -> (Tensor<3>, RenderAux) {
     splats.clone().validate_values().await;
@@ -419,6 +420,7 @@ pub async fn render_splats(
         raw_opacities.into_dispatch(),
         render_mode,
         background,
+        cov_blur,
         pass,
     )
     .await;

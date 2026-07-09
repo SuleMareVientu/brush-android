@@ -178,7 +178,7 @@ pub fn project_backwards_kernel(
     let m = r.mul_diag(scale);
 
     let raw_cov = calc_cov2d(scale, quat, mean_c, u, camera_model);
-    let (cov, filter_comp) = compensate_cov2d(raw_cov, mip_splatting);
+    let (cov, filter_comp) = compensate_cov2d(raw_cov, u.cov_blur, mip_splatting);
     let opac_sig = sigmoid(raw_opac[global_gid as usize]);
     v_raw_opac[global_gid as usize] = filter_comp * v_alpha_in * opac_sig * (1.0f32 - opac_sig);
 

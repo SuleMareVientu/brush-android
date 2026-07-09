@@ -247,6 +247,16 @@ async fn load_dataset_inner(
             .await
             .ok()?;
 
+        let mut points_data = points_data;
+        // RAIN-GS: sort by reprojection error and keep the top 10% lowest error points
+        points_data.sort_by(|a, b| {
+            let err_a = a.aux.as_ref().map(|ax| ax.error).unwrap_or(f64::INFINITY);
+            let err_b = b.aux.as_ref().map(|ax| ax.error).unwrap_or(f64::INFINITY);
+            err_a.partial_cmp(&err_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let keep_count = (points_data.len() / 10).max(1);
+        points_data.truncate(keep_count);
+
         if points_data.is_empty() {
             return None;
         }

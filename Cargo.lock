@@ -1206,7 +1206,7 @@ dependencies = [
  "clap",
  "getrandom 0.4.3",
  "glam",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "image",
  "log",
  "lpips",

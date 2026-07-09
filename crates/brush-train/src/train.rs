@@ -115,19 +115,22 @@ pub async fn get_splat_bounds(splats: Splats, percentile: f32) -> BoundingBox {
 }
 
 impl SplatTrainer {
-    #[allow(unused_variables)]
     pub fn new(config: &TrainConfig, device: &Device, bounds: BoundingBox) -> Self {
+        let mut config = config.clone();
+        // Scale warmup iterations if the total train iterations are smaller than default.
+        // We ensure we leave at least 5 refinement cycles (or 1/2 of training) at the end
+        // to let the ABE-split Gaussians settle and prune.
+        let settle_steps = (5 * config.refine_every).min(config.total_train_iters / 2);
+        config.warmup_iter = config.warmup_iter.min(config.total_train_iters.saturating_sub(settle_steps));
+        config.sh_warmup_iter = config.sh_warmup_iter.min(config.warmup_iter / 2);
+        config.growth_stop_iter = config.growth_stop_iter.min(config.total_train_iters);
+
+        let decay_steps = config.total_train_iters.saturating_sub(config.warmup_iter).max(1);
         let decay =
-            (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
+            (config.lr_mean_end / config.lr_mean).powf(1.0 / decay_steps as f64);
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
 
         let ssim_enabled = config.ssim_weight > 0.0;
-
-        // Growth is gated on the global iter. LOD phases run past
-        // total_train_iters but their refines should never grow — clamp
-        // here so growth_stop is never effectively past end-of-training.
-        let mut config = config.clone();
-        config.growth_stop_iter = config.growth_stop_iter.min(config.total_train_iters);
 
         #[cfg(not(target_family = "wasm"))]
         let lpips = (config.lpips_loss_weight > 0.0).then(|| lpips::load_vgg_lpips(device));

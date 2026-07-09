@@ -93,7 +93,10 @@ pub async fn load_dataset(
         .find(|p| p.file_name().is_some_and(|n| n == "init.ply"))
         .or_else(|| ply_paths.last());
 
-    let init_splat = if let Some(main_ply) = main_ply {
+    let init_splat = if load_args.no_point_cloud {
+        log::info!("Disabling point cloud loading as requested by no_point_cloud config.");
+        None
+    } else if let Some(main_ply) = main_ply {
         log::info!("Using ply {main_ply:?} as initial point cloud.");
         let reader = vfs
             .reader_at_path(main_ply)

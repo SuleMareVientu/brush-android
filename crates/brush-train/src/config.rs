@@ -137,6 +137,10 @@ pub struct TrainConfig {
     /// estimated from the camera spacing (with a 1m minimum).
     #[arg(long, help_heading = "Training options")]
     pub random_init_scene_scale: Option<f32>,
+
+    /// Number of splats to initialize when starting randomly from scratch.
+    #[arg(long, help_heading = "Training options", default_value = "10")]
+    pub random_init_count: usize,
 }
 
 impl Default for TrainConfig {

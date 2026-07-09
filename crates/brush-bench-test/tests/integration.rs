@@ -372,6 +372,7 @@ async fn stress_concurrent_train_and_view() {
                     img_size,
                     Vec3::ZERO,
                     None,
+                    Some(0.3),
                     TextureMode::Float,
                 )
                 .await;

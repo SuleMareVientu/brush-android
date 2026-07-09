@@ -84,13 +84,18 @@ pub fn create_random_splats(
     // Large variance for low-frequency structure
     let large_scale = (bounds_extent * 1.5).ln();
 
-    // Sample points in the camera bounding box
+    let center = (min_pos + max_pos) / 2.0;
+    let half_size = camera_dist * 1.5;
+    let sample_min = center - half_size;
+    let sample_max = center + half_size;
+
+    // Sample points in 3x the camera bounding box
     let positions: Vec<f32> = (0..num_points)
         .flat_map(|_| {
             [
-                rng.random_range(min_pos.x..max_pos.x),
-                rng.random_range(min_pos.y..max_pos.y),
-                rng.random_range(min_pos.z..max_pos.z),
+                rng.random_range(sample_min.x..sample_max.x),
+                rng.random_range(sample_min.y..sample_max.y),
+                rng.random_range(sample_min.z..sample_max.z),
             ]
         })
         .collect();

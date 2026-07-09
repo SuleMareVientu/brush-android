@@ -375,6 +375,11 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
         };
     }
 
+    ui.add_enabled(
+        enabled,
+        egui::Checkbox::new(&mut args.load_config.no_point_cloud, "Train from scratch (no point cloud)"),
+    );
+
     if alpha_mode_enabled {
         let mut alpha_mode = args.load_config.alpha_mode.unwrap_or_default();
         ui.add_enabled_ui(enabled, |ui| {

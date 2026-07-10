@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "apps/brush-aar",
     "apps/brush-app",
     "apps/brush-c",
     "apps/brush-cli",

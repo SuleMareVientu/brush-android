@@ -58,24 +58,38 @@ WebGPU is still an upcoming standard, and as such, only Chrome 134+ on Windows a
 ### Android
 
 As a one time setup, make sure you have the Android SDK & NDK installed.
-- Check if ANDROID_NDK_HOME and ANDROID_HOME are set
-- Add the Android target to rust `rustup target add aarch64-linux-android`
-- Install cargo-ndk to manage building a lib `cargo install cargo-ndk`
+- Check if `ANDROID_NDK_HOME` and `ANDROID_HOME` are set.
+- Add the Android target to rust: `rustup target add aarch64-linux-android`
+- Install cargo-ndk to manage building a native library: `cargo install cargo-ndk`
 
-Each time you change the rust code, run
-- `cargo ndk -t arm64-v8a -o crates/brush-app/app/src/main/jniLibs/ build`
-- Nb:  Nb, for best performance, build in release mode. This is separate
-  from the Android Studio app build configuration.
-- `cargo ndk -t arm64-v8a -o crates/brush-app/app/src/main/jniLibs/  build --release`
+#### Build the Android Brush App (GUI)
+To compile the native library for the app:
+- `cargo ndk -t arm64-v8a -o crates/brush-app/app/src/main/jniLibs/ build --release`
 
-You can now either run the project from Android Studio (Android Studio does NOT build the rust code), or run it from the command line:
+You can now run the app from Android Studio, or execute the following from the root directory:
 ```
 ./gradlew build
 ./gradlew installDebug
 adb shell am start -n com.splats.app/.MainActivity
 ```
 
-You can also open this folder as a project in Android Studio and run things from there. Nb: Running in Android Studio does _not_ rebuild the rust code automatically.
+#### Build the Brush AAR Library (Headless SDK Crate)
+This crate compiles the core Rust training loop and provides a fluent Kotlin interface (`BrushEngine`) for importing into external projects as an `.aar` package.
+
+1. **Compile the Rust library:**
+   ```powershell
+   $env:ANDROID_NDK_HOME="<path-to-ndk-e.g.-Sdk/ndk/25.1.8937393>"
+   cargo ndk -t arm64-v8a -o apps/brush-aar/library/src/main/jniLibs/ build --package brush-aar --release
+   ```
+2. **Build the AAR package:**
+   Navigate to `apps/brush-aar` and run:
+   ```powershell
+   $env:JAVA_HOME="<path-to-compatible-jdk-or-android-studio-jbr>"
+   .\gradlew assembleRelease
+   ```
+3. **Output Artifact:**
+   The output library file is created at:
+   `apps/brush-aar/library/build/outputs/aar/library-release.aar`
 
 ## Benchmarks
 

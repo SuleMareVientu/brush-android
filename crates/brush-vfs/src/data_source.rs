@@ -20,6 +20,9 @@ pub enum DataSource {
     #[cfg(target_family = "wasm")]
     #[serde(skip)]
     PickedDirectory(rrfd::wasm::DirectoryHandle, String),
+    /// In-memory buffer source (e.g., zip loaded over JNI).
+    #[serde(skip)]
+    Buffer(Vec<u8>, String),
 }
 
 // Implement FromStr to allow Clap to parse string arguments into DataSource
@@ -46,6 +49,7 @@ impl fmt::Display for DataSource {
             Self::Path(_) => write!(f, "Path"),
             #[cfg(target_family = "wasm")]
             Self::PickedDirectory(_, name) => write!(f, "{name}"),
+            Self::Buffer(_, name) => write!(f, "{name}"),
         }
     }
 }
@@ -99,6 +103,10 @@ impl DataSource {
             #[cfg(target_family = "wasm")]
             Self::PickedDirectory(handle, _) => {
                 Ok(Arc::new(BrushVfs::from_directory_handle(handle).await?))
+            }
+            Self::Buffer(bytes, name) => {
+                let reader = BufReader::new(std::io::Cursor::new(bytes));
+                Ok(Arc::new(BrushVfs::from_reader(reader, Some(name)).await?))
             }
         }
     }

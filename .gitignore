@@ -45,3 +45,10 @@ brush-app/captures
 local.properties
 *.so
 .claude/settings.local.json
+
+# Brush AAR build files
+apps/brush-aar/build/
+apps/brush-aar/library/build/
+apps/brush-aar/library/src/main/jniLibs/
+apps/brush-aar/local.properties
+

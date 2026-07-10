@@ -841,6 +841,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "brush-aar"
+version = "0.3.0"
+dependencies = [
+ "android_logger",
+ "anyhow",
+ "brush-async",
+ "brush-dataset",
+ "brush-process",
+ "brush-render",
+ "brush-serde",
+ "brush-vfs",
+ "jni",
+ "log",
+ "memory-stats",
+ "parse-size",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "brush-app"
 version = "0.3.0"
 dependencies = [

@@ -1,0 +1,35 @@
+[package]
+name = "brush-aar"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "brush_aar"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Workspace crates
+brush-process = { path = "../../crates/brush-process" }
+brush-dataset = { path = "../../crates/brush-dataset" }
+brush-render = { path = "../../crates/brush-render" }
+brush-serde = { path = "../../crates/brush-serde" }
+brush-async = { path = "../../crates/brush-async" }
+
+# Workspace dependency mappings
+anyhow = { workspace = true }
+tracing = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "io-util"] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-stream = { workspace = true }
+brush-vfs = { path = "../../crates/brush-vfs" }
+parse-size = { workspace = true }
+memory-stats = "1.2.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15.0"
+jni = "0.22"

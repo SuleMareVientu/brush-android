@@ -1,13 +1,53 @@
 #![cfg(target_os = "android")]
 
 use jni::EnvUnowned;
-use jni::objects::{JClass, JString, JByteArray};
+use jni::objects::{JClass, JString, JByteArray, JValue};
 use jni::sys::jint;
 use serde::Deserialize;
 use std::os::fd::FromRawFd;
 use std::fs::File;
 use std::io::Read;
 use std::thread;
+
+use std::sync::OnceLock;
+use jni::refs::Global;
+
+static BRUSH_ENGINE_CLASS: OnceLock<Global<jni::objects::JObject<'static>>> = OnceLock::new();
+
+#[allow(improper_ctypes_definitions)]
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _reserved: *mut std::ffi::c_void) -> jni::sys::jint {
+    android_logger::init_once(
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+    );
+
+    let _ = vm.attach_current_thread(|env| {
+        if let Ok(class) = env.find_class(jni::strings::JNIString::from("com/splats/brush/BrushEngine")) {
+            let class_obj: &jni::objects::JObject = class.as_ref();
+            if let Ok(global_ref) = env.new_global_ref(class_obj) {
+                let _ = BRUSH_ENGINE_CLASS.set(global_ref);
+                log::info!("JNI_OnLoad: Successfully cached BrushEngine class reference");
+            } else {
+                log::error!("JNI_OnLoad: Failed to create global reference for BrushEngine class");
+            }
+        } else {
+            log::error!("JNI_OnLoad: Failed to find BrushEngine class");
+        }
+        Ok::<(), jni::errors::Error>(())
+    });
+
+    jni::sys::JNI_VERSION_1_6
+}
+
+fn get_brush_engine_class<'local>(env: &mut jni::Env<'local>) -> Result<JClass<'local>, jni::errors::Error> {
+    if let Some(global_ref) = BRUSH_ENGINE_CLASS.get() {
+        let class_obj = env.new_local_ref(global_ref.as_obj())?;
+        JClass::cast_local(env, class_obj)
+    } else {
+        log::warn!("BrushEngine class was not cached in JNI_OnLoad, falling back to find_class");
+        env.find_class(jni::strings::JNIString::from("com/splats/brush/BrushEngine"))
+    }
+}
 
 use brush_render::AlphaMode;
 
@@ -110,6 +150,16 @@ pub extern "system" fn Java_com_splats_brush_BrushEngine_startNative<'local>(
     };
     log::info!("JNI: Loaded Configuration: {:?}", config);
 
+    let jvm = match env.with_env(|env| env.get_java_vm()).into_outcome() {
+        jni::Outcome::Ok(vm) => vm,
+        jni::Outcome::Err(e) => {
+            log::error!("JNI: Failed to get JavaVM: {:?}", e);
+            return;
+        }
+        jni::Outcome::Panic(p) => {
+            std::panic::resume_unwind(p);
+        }
+    };
 
     // 4. Delegate to training engine in a background thread to prevent Android UI ANRs.
     thread::spawn(move || {
@@ -121,7 +171,7 @@ pub extern "system" fn Java_com_splats_brush_BrushEngine_startNative<'local>(
         }
         log::info!("JNI: Successfully read {} bytes from FD", buffer.len());
 
-        run_training_engine(config, buffer);
+        run_training_engine(config, buffer, jvm);
     });
 }
 
@@ -167,15 +217,26 @@ pub extern "system" fn Java_com_splats_brush_BrushEngine_startFromBufferNative<'
     }
     log::info!("JNI: Successfully converted {} bytes from Java byte array", buffer.len());
 
+    let jvm = match env.with_env(|env| env.get_java_vm()).into_outcome() {
+        jni::Outcome::Ok(vm) => vm,
+        jni::Outcome::Err(e) => {
+            log::error!("JNI: Failed to get JavaVM: {:?}", e);
+            return;
+        }
+        jni::Outcome::Panic(p) => {
+            std::panic::resume_unwind(p);
+        }
+    };
+
     // 4. Delegate to training engine in a background thread to prevent Android UI ANRs.
     thread::spawn(move || {
         log::info!("Background thread started for native buffer processing.");
-        run_training_engine(config, buffer);
+        run_training_engine(config, buffer, jvm);
     });
 }
 
 /// Headless core training engine worker.
-fn run_training_engine(config: TrainingConfig, buffer: Vec<u8>) {
+fn run_training_engine(config: TrainingConfig, buffer: Vec<u8>, jvm: jni::JavaVM) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -297,12 +358,44 @@ fn run_training_engine(config: TrainingConfig, buffer: Vec<u8>) {
                                     mem_info
                                 );
                             }
+
+                            let total_iters = config.total_train_iters;
+                            let elapsed_ms = total_elapsed.as_millis() as i64;
+                            let _ = jvm.attach_current_thread(|env| {
+                                let class = get_brush_engine_class(&mut *env)?;
+                                let _ = env.call_static_method(
+                                    &class,
+                                    jni::strings::JNIString::from("onProgressFromNative"),
+                                    jni::jni_sig!("(IIJ)V"),
+                                    &[
+                                        JValue::Int(iter as i32),
+                                        JValue::Int(total_iters as i32),
+                                        JValue::Long(elapsed_ms),
+                                    ],
+                                )?;
+                                Ok::<(), jni::errors::Error>(())
+                            });
                         }
                         brush_process::message::TrainMessage::RefineStep { cur_splat_count, iter, .. } => {
                             log::info!("Refine step at iter {}: {} splats", iter, cur_splat_count);
                         }
                         brush_process::message::TrainMessage::EvalResult { iter, avg_psnr, avg_ssim } => {
                             log::info!("Eval at iter {}: PSNR = {}, SSIM = {}", iter, avg_psnr, avg_ssim);
+
+                             let _ = jvm.attach_current_thread(|env| {
+                                 let class = get_brush_engine_class(&mut *env)?;
+                                 let _ = env.call_static_method(
+                                     &class,
+                                     jni::strings::JNIString::from("onEvalResultFromNative"),
+                                     jni::jni_sig!("(IFF)V"),
+                                     &[
+                                         JValue::Int(iter as i32),
+                                         JValue::Float(avg_psnr),
+                                         JValue::Float(avg_ssim),
+                                     ],
+                                 )?;
+                                 Ok::<(), jni::errors::Error>(())
+                             });
                         }
                         brush_process::message::TrainMessage::Dataset { dataset } => {
                             log::info!("Dataset loaded. Train views: {}, Eval views: {:?}", 
@@ -312,6 +405,17 @@ fn run_training_engine(config: TrainingConfig, buffer: Vec<u8>) {
                         }
                         brush_process::message::TrainMessage::DoneTraining => {
                             log::info!("Training complete!");
+
+                             let _ = jvm.attach_current_thread(|env| {
+                                 let class = get_brush_engine_class(&mut *env)?;
+                                 let _ = env.call_static_method(
+                                     &class,
+                                     jni::strings::JNIString::from("onTrainingCompleteFromNative"),
+                                     jni::jni_sig!("()V"),
+                                     &[],
+                                 )?;
+                                 Ok::<(), jni::errors::Error>(())
+                             });
                         }
                         _ => {}
                     }

@@ -182,4 +182,33 @@ object BrushEngine {
             Log.e(TAG, "Exception starting from memory buffer", e)
         }
     }
+
+    private var progressListener: BrushProgressListener? = null
+
+    @JvmStatic
+    fun setProgressListener(listener: BrushProgressListener?) {
+        this.progressListener = listener
+    }
+
+    @JvmStatic
+    private fun onProgressFromNative(iter: Int, total: Int, elapsedMs: Long) {
+        progressListener?.onProgress(iter, total, elapsedMs)
+    }
+
+    @JvmStatic
+    private fun onEvalResultFromNative(iter: Int, psnr: Float, ssim: Float) {
+        progressListener?.onEvalResult(iter, psnr, ssim)
+    }
+
+    @JvmStatic
+    private fun onTrainingCompleteFromNative() {
+        progressListener?.onTrainingComplete()
+    }
 }
+
+interface BrushProgressListener {
+    fun onProgress(iter: Int, total: Int, elapsedMs: Long)
+    fun onEvalResult(iter: Int, psnr: Float, ssim: Float)
+    fun onTrainingComplete()
+}
+

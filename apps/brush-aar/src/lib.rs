@@ -316,8 +316,11 @@ fn run_training_engine(config: TrainingConfig, buffer: Vec<u8>, jvm: jni::JavaVM
             train_stream_config.process_config.export_path = path;
         }
 
-        // Initialize the burn backend (WGPU Setup)
-        brush_process::burn_init_setup().await;
+        // Initialize the burn backend (WGPU Setup) once per process lifetime
+        static BURN_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        let _ = BURN_INIT.get_or_init(|| async {
+            brush_process::burn_init_setup().await;
+        }).await;
 
         // Create the process
         let process = brush_process::create_process(source, async move |_init| {

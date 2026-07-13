@@ -1,3 +1,15 @@
 [target.wasm32-unknown-unknown]
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
 runner = 'wasm-bindgen-test-runner'
+
+[target.aarch64-linux-android]
+rustflags = [
+  "-C", "link-arg=-fuse-ld=lld",
+  "-C", "link-arg=-Wl,--gc-sections",
+]
+
+[target.x86_64-linux-android]
+rustflags = [
+  "-C", "link-arg=-fuse-ld=lld",
+  "-C", "link-arg=-Wl,--gc-sections",
+]

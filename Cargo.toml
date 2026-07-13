@@ -141,13 +141,23 @@ alphanumeric-sort = "1.5.3"
 # wgpu.path = "../wgpu/wgpu"
 # naga.path = "../wgpu/naga"
 
+# Optimizations for 'cargo build' and 'cargo run' during local development
 [profile.dev]
-opt-level = 1
-# Reduce debuginfo for faster linking
-debug = 1
+opt-level = 0           # Keep your local code unoptimized for max compilation speed
+debug = 1               # Line tables only (reduces file sizes and linking overhead)
+split-debuginfo = "unpacked" # Keeps debug data out of the binary (massively speeds up macOS/Windows)
+
+# Force all external dependencies to compile with full optimization
+# This keeps your app fast if you use heavy crates like Bevy, Tokio, or Tauri
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
-lto = "thin"
+opt-level = "z"     # Optimize for smallest binary size (critical for mobile apps)
+lto = "thin"        # Link-Time Optimization across crates (improves performance)
+codegen-units = 1   # Reduces parallelism to allow deeper compiler optimization
+panic = "abort"     # Removes stack unwinding code, shrinking binary size significantly
+#strip = true        # Automatically strips all debug symbols and names from the binary
 
 [workspace.lints.rust]
 future_incompatible = { level = "warn", priority = -1 }

@@ -1,10 +1,11 @@
-use burn_cubecl::cubecl;
-use burn_cubecl::cubecl::cube;
-use burn_cubecl::cubecl::frontend::CompilationArg;
-use burn_cubecl::cubecl::frontend::IndexMutExpand;
-use burn_cubecl::cubecl::prelude::*;
+use burn::cubecl;
+use burn::cubecl::cube;
+use burn::cubecl::frontend::CompilationArg;
+use burn::cubecl::frontend::IndexMutExpand;
+use burn::cubecl::prelude::*;
 
-pub const THREADS_PER_GROUP: usize = 512;
+// WebGPU guarantees at least 256 invocations per workgroup.
+pub const THREADS_PER_GROUP: usize = 256;
 
 #[cube]
 fn linear_workgroup_id() -> usize {

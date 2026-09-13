@@ -11,6 +11,7 @@
 //! away from f16 quantization limits) so central differences are
 //! second-order accurate.
 
+use brush_render::bwd::render_splats_with_pass;
 use brush_render::gaussian_splats::RasterPass;
 use brush_render::{
     camera::Camera,
@@ -20,7 +21,6 @@ use brush_render::{
         radial_tangential_8::RadialTangential8Params, thin_prism_fisheye::ThinPrismFisheyeParams,
     },
 };
-use brush_render_bwd::render_splats_with_pass;
 
 /// Finite-diff tests need the C^1 cutoff so analytical and numerical
 /// agree at typical eps; production paths use the hard step.
@@ -169,7 +169,7 @@ async fn read_first<const D: usize>(t: Tensor<D>) -> f32 {
     t.into_data_async()
         .await
         .expect("readback")
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .expect("vec")[0]
 }
 
@@ -300,7 +300,7 @@ async fn finite_diff_tangential_quat() {
         .into_data_async()
         .await
         .expect("rb")
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .expect("v");
 
     // Radial direction (parallel to identity quat) must have ~0 grad —

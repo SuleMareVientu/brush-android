@@ -5,9 +5,14 @@ pub mod slot;
 pub mod train_stream;
 
 pub use brush_vfs::DataSource;
+pub type ProcessDevice = burn::tensor::Device;
+
+pub fn default_device() -> ProcessDevice {
+    WgpuDevice::DefaultDevice.into()
+}
 
 use burn_wgpu::{
-    AutoCompiler, RuntimeOptions, WgpuDevice,
+    RuntimeOptions, WgpuDevice,
     graphics::{AutoGraphicsApi, GraphicsApi},
 };
 use wgpu::{Adapter, Device, Queue};
@@ -18,9 +23,8 @@ use std::pin::{Pin, pin};
 use anyhow::Error;
 use async_fn_stream::{TryStreamEmitter, try_fn_stream};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
+use brush_train::train::{BOUND_PERCENTILE, get_splat_bounds};
 use brush_vfs::SendNotWasm;
-use burn_cubecl::cubecl::Runtime;
-use burn_wgpu::WgpuRuntime;
 use tokio_stream::{Stream, StreamExt};
 
 fn burn_options() -> RuntimeOptions {
@@ -30,18 +34,13 @@ fn burn_options() -> RuntimeOptions {
     }
 }
 
-pub async fn burn_init_setup() -> WgpuDevice {
+pub async fn burn_init_setup() -> ProcessDevice {
     burn_wgpu::init_setup_async::<AutoGraphicsApi>(&WgpuDevice::DefaultDevice, burn_options())
         .await;
-    connect_device(WgpuDevice::DefaultDevice);
-    WgpuDevice::DefaultDevice
+    default_device()
 }
 
-/// Initialize Burn with a wgpu setup the host already owns. Useful when
-/// integrating with an existing wgpu/WebGPU application that wants to share
-/// its device with Brush so tensor buffers can flow back into the host's
-/// render pipeline without copies.
-pub fn burn_init_device(adapter: Adapter, device: Device, queue: Queue) -> WgpuDevice {
+pub fn burn_init_device(adapter: Adapter, device: Device, queue: Queue) -> ProcessDevice {
     let setup = burn_wgpu::WgpuSetup {
         instance: wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle()), // unused... need to fix this in Burn.
         adapter,
@@ -50,8 +49,7 @@ pub fn burn_init_device(adapter: Adapter, device: Device, queue: Queue) -> WgpuD
         backend: AutoGraphicsApi::backend(),
     };
     let burn = burn_wgpu::init_device(setup, burn_options());
-    connect_device(burn.clone());
-    burn
+    burn.into()
 }
 
 use crate::{
@@ -66,6 +64,7 @@ impl<T> ProcessStream for T where T: Stream<Item = Result<ProcessMessage, Error>
 pub struct RunningProcess {
     pub stream: Pin<Box<dyn ProcessStream>>,
     pub splat_view: Slot<Splats>,
+    pub device: ProcessDevice,
 }
 
 /// Convenience alias for the emitter `try_fn_stream` hands us inside
@@ -73,19 +72,19 @@ pub struct RunningProcess {
 /// machine, so this is just the channel for `emit(msg).await`.
 pub(crate) type Emitter = TryStreamEmitter<ProcessMessage, Error>;
 
-use tokio::sync::SetOnce;
-
-static DEVICE: SetOnce<WgpuDevice> = SetOnce::const_new();
-
-pub(crate) fn connect_device(device: WgpuDevice) {
-    // Idempotent: a JS host can call `init()` and `init_existing()`, or a
-    // dev-mode double-mount can re-run setup. Re-registering the same device
-    // is fine; we only care that *some* device wins the race.
-    let _ = DEVICE.set(device);
+pub fn device_memory_cleanup(device: &ProcessDevice) {
+    use burn::backend::DispatchDevice;
+    if let DispatchDevice::Cube(d) = device.as_dispatch() {
+        d.client().memory_cleanup();
+    }
 }
 
-pub async fn wait_for_device() -> &'static WgpuDevice {
-    DEVICE.wait().await
+pub fn device_memory_usage(device: &ProcessDevice) -> Option<burn::cubecl::MemoryUsage> {
+    use burn::backend::DispatchDevice;
+    match device.as_dispatch() {
+        DispatchDevice::Cube(d) => Some(d.client().memory_usage()),
+        DispatchDevice::Autodiff(_) => None,
+    }
 }
 
 /// Create a running process from a datasource and args.
@@ -101,16 +100,27 @@ pub fn create_process<
     source: DataSource,
     config_fn: Fun,
 ) -> RunningProcess {
-    let (splat_tx, splat_view) = crate::slot::channel();
+    create_process_with_device(source, default_device(), config_fn)
+}
 
-    let stream =
-        try_fn_stream(
-            |emitter| async move { run_process(source, config_fn, &emitter, splat_tx).await },
-        );
+pub fn create_process_with_device<
+    Fun: FnOnce(crate::config::TrainStreamConfig) -> Fut + SendNotWasm + 'static,
+    Fut: Future<Output = Option<crate::config::TrainStreamConfig>> + SendNotWasm,
+>(
+    source: DataSource,
+    device: ProcessDevice,
+    config_fn: Fun,
+) -> RunningProcess {
+    let (splat_tx, splat_view) = crate::slot::channel();
+    let process_device = device.clone();
+    let stream = try_fn_stream(|emitter| async move {
+        run_process(source, config_fn, &emitter, splat_tx, &process_device).await
+    });
 
     RunningProcess {
         stream: Box::pin(stream),
         splat_view,
+        device,
     }
 }
 
@@ -122,6 +132,7 @@ async fn run_process<
     config_fn: Fun,
     emitter: &Emitter,
     splat_view: SlotSender<Splats>,
+    device: &ProcessDevice,
 ) -> Result<(), Error> {
     log::info!("Starting process with source {source:?}");
     emitter.emit(ProcessMessage::NewProcess).await;
@@ -176,11 +187,8 @@ async fn run_process<
         .await;
 
     if !is_training {
-        let wgpu_device = wait_for_device().await;
-        let device: burn::tensor::Device = wgpu_device.clone().into();
         let mut paths: Vec<_> = vfs.file_paths().collect();
         alphanumeric_sort::sort_path_slice(&mut paths);
-        let client = WgpuRuntime::<AutoCompiler>::client(wgpu_device);
         let total_frames = paths.len() as u32;
 
         for (frame, path) in paths.iter().enumerate() {
@@ -196,11 +204,11 @@ async fn run_process<
                 let message = message?;
 
                 let mode = message.meta.render_mode.unwrap_or(SplatRenderMode::Default);
-                let splats = message.data.into_splats(&device, mode);
+                let splats = message.data.into_splats(device, mode);
 
                 // As loading concatenates splats each time, memory usage tends to accumulate a lot
                 // over time. Clear out memory after each step to prevent this buildup.
-                client.memory_cleanup();
+                device_memory_cleanup(device);
 
                 // For the first frame of a new file, clear existing frames
                 if frame == 0 {
@@ -210,6 +218,9 @@ async fn run_process<
                 // Capture stats before moving splats
                 let num_splats = splats.num_splats();
                 let sh_degree = splats.sh_degree();
+                let scene_scale = get_splat_bounds(splats.clone(), BOUND_PERCENTILE)
+                    .await
+                    .median_size();
                 splat_view.set(frame, splats);
 
                 emitter
@@ -219,6 +230,7 @@ async fn run_process<
                         total_frames,
                         num_splats,
                         sh_degree,
+                        scene_scale,
                     })
                     .await;
             }
@@ -234,7 +246,7 @@ async fn run_process<
             log::info!("config_fn returned None — aborting before training");
             return Ok(());
         };
-        train_stream(vfs, config, emitter, splat_view).await?;
+        train_stream(vfs, config, emitter, splat_view, device).await?;
     };
 
     Ok(())

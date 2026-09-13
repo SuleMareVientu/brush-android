@@ -76,7 +76,7 @@ pub async fn run_headless(
 /// drive the indicatif UI on the main task.
 pub async fn run_cli_ui(
     mut process: RunningProcess,
-    #[allow(unused)] train_stream_config: TrainStreamConfig,
+    train_stream_config: TrainStreamConfig,
 ) -> Result<(), anyhow::Error> {
     // Pump the trainer stream from a dedicated Actor thread; the
     // indicatif UI loop below consumes its output on the main task.
@@ -113,6 +113,8 @@ pub async fn run_cli_ui(
         multi
     };
 
+    log::info!("Compute backend: {:?}", process.device);
+
     let main_spinner = ProgressBar::new_spinner().with_style(
         ProgressStyle::with_template("{spinner:.blue} {msg}")
             .expect("Invalid indacitif config")
@@ -147,9 +149,10 @@ pub async fn run_cli_ui(
             .tick_strings(&["ℹ️", "ℹ️"]),
     );
 
+    // Sized once the process emits its final config: the CLI args alone are
+    // wrong when a dataset's args.txt is merged in.
     let train_progress = {
-        let tc = &train_stream_config.train_config;
-        let bar = ProgressBar::new(tc.total_iters() as u64)
+        let bar = ProgressBar::new(0)
         .with_style(
             ProgressStyle::with_template(
                 "[{elapsed}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg} ({per_sec}, {eta} remaining)",
@@ -184,6 +187,7 @@ pub async fn run_cli_ui(
 
     #[allow(unused_mut)]
     let mut duration = Duration::from_secs(0);
+    let mut eval_every = train_stream_config.process_config.eval_every;
 
     while let Some(msg) = messages.recv().await {
         let _span = trace_span!("CLI UI").entered();
@@ -211,7 +215,10 @@ pub async fn run_cli_ui(
             }
             ProcessMessage::SplatsUpdated { .. } => {}
             ProcessMessage::TrainMessage(train) => match train {
-                TrainMessage::TrainConfig { .. } => {}
+                TrainMessage::TrainConfig { config } => {
+                    train_progress.set_length(config.train_config.total_iters() as u64);
+                    eval_every = config.process_config.eval_every;
+                }
                 TrainMessage::Dataset { dataset } => {
                     let train_views = dataset.train.views.len();
                     let eval_views = dataset.eval.as_ref().map_or(0, |v| v.views.len());
@@ -223,8 +230,7 @@ pub async fn run_cli_ui(
                     ));
                     if eval_views > 0 {
                         eval_spinner.set_message(format!(
-                            "evaluating {} views every {} steps",
-                            eval_views, train_stream_config.process_config.eval_every,
+                            "evaluating {eval_views} views every {eval_every} steps",
                         ));
                     } else {
                         eval_spinner.finish_and_clear();
@@ -271,8 +277,9 @@ pub async fn run_cli_ui(
                 stats_spinner.set_message("Completed loading");
             }
             ProcessMessage::Warning { error } => {
-                log::warn!("{error}");
-                sp.println(format!("⚠️: {error}"))?;
+                // Alternate form prints the whole anyhow context chain.
+                log::warn!("{error:#}");
+                sp.println(format!("⚠️: {error:#}"))?;
             }
             #[allow(unreachable_patterns)]
             _ => {}
@@ -291,4 +298,88 @@ pub async fn run_cli_ui(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_source_and_overrides() {
+        let cli = Cli::try_parse_from([
+            "brush-cli",
+            "some/dataset/path",
+            "--total-train-iters",
+            "50",
+            "--eval-split-every",
+            "2",
+            "--max-resolution",
+            "512",
+            "--sh-degree",
+            "2",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            &cli.source,
+            Some(DataSource::Path(p)) if p == "some/dataset/path"
+        ));
+        // Passing a source flips the viewer default off.
+        assert!(!cli.with_viewer);
+
+        let ts = &cli.train_stream;
+        assert_eq!(ts.train_config.total_train_iters, 50);
+        assert_eq!(ts.train_config.total_iters(), 50); // No LOD levels by default.
+        assert_eq!(ts.load_config.eval_split_every, Some(2));
+        assert_eq!(ts.load_config.max_resolution, 512);
+        assert_eq!(ts.model_config.sh_degree, 2);
+        assert_eq!(ts.process_config.seed, 7);
+
+        // A source without a viewer is a valid combination.
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn parses_url_source() {
+        let cli = Cli::try_parse_from(["brush-cli", "https://example.com/data.zip"]).unwrap();
+        assert!(matches!(
+            &cli.source,
+            Some(DataSource::Url(u)) if u == "https://example.com/data.zip"
+        ));
+    }
+
+    #[test]
+    fn defaults_to_viewer_without_source() {
+        let cli = Cli::try_parse_from(["brush-cli"]).unwrap();
+        assert!(cli.source.is_none());
+        assert!(cli.with_viewer);
+        // Viewer without a source is valid (brush-app's default mode).
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn viewer_flag_with_source() {
+        let cli = Cli::try_parse_from(["brush-cli", "some/path", "--with-viewer"]).unwrap();
+        assert!(cli.with_viewer);
+        assert!(cli.source.is_some());
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_headless_without_source() {
+        let mut cli = Cli::try_parse_from(["brush-cli"]).unwrap();
+        cli.with_viewer = false;
+        let Err(err) = cli.validate() else {
+            panic!("expected validation error")
+        };
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn rejects_unknown_flag() {
+        assert!(Cli::try_parse_from(["brush-cli", "--not-a-real-flag"]).is_err());
+    }
 }

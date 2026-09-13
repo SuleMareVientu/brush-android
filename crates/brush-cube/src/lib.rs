@@ -20,16 +20,15 @@
 mod host;
 pub mod test_helpers;
 use burn_wgpu::CubeBackend;
-use burn_wgpu::Wgpu;
-use burn_wgpu::WgpuRuntime;
 pub use host::*;
 
-pub type MainBackend = Wgpu;
-pub type MainBackendBase = CubeBackend<WgpuRuntime>;
+pub type MainDevice = burn_wgpu::WgpuDevice;
+pub type MainBackendBase = CubeBackend;
+pub type MainBackend = burn_wgpu::Wgpu;
 
-use burn_cubecl::cubecl;
-use burn_cubecl::cubecl::cube;
-use burn_cubecl::cubecl::prelude::*;
+use burn::cubecl;
+use burn::cubecl::cube;
+use burn::cubecl::prelude::*;
 
 /// 3-component f32 vector, padded to 4 lanes — same shape as
 /// `glam::Vec3A`. See the module-level note on the cubecl-cpp
@@ -44,23 +43,23 @@ pub struct Vec3A {
 impl Vec3A {
     pub fn new(x: f32, y: f32, z: f32) -> Vec3A {
         let mut v = Vector::<f32, Const<4>>::empty();
-        v.insert(0, x);
-        v.insert(1, y);
-        v.insert(2, z);
+        v.insert(0usize, x);
+        v.insert(1usize, y);
+        v.insert(2usize, z);
         // Padding lane — must stay 0 so `dot` / `length` see only the
         // three real components.
-        v.insert(3, 0.0f32);
+        v.insert(3usize, 0.0f32);
         Vec3A { inner: v }
     }
 
     pub fn x(self) -> f32 {
-        self.inner.extract(0)
+        self.inner.extract(0usize)
     }
     pub fn y(self) -> f32 {
-        self.inner.extract(1)
+        self.inner.extract(1usize)
     }
     pub fn z(self) -> f32 {
-        self.inner.extract(2)
+        self.inner.extract(2usize)
     }
 
     pub fn add(self, other: Vec3A) -> Vec3A {
@@ -84,7 +83,7 @@ impl Vec3A {
     pub fn dot(self, other: Vec3A) -> f32 {
         let p = self.inner * other.inner;
         // Lane 3 is always 0 in both operands → no special case.
-        p.extract(0) + p.extract(1) + p.extract(2) + p.extract(3)
+        p.extract(0usize) + p.extract(1usize) + p.extract(2usize) + p.extract(3usize)
     }
 
     pub fn length(self) -> f32 {
@@ -111,16 +110,16 @@ pub struct Vec2 {
 impl Vec2 {
     pub fn new(x: f32, y: f32) -> Vec2 {
         let mut v = Vector::<f32, Const<2>>::empty();
-        v.insert(0, x);
-        v.insert(1, y);
+        v.insert(0usize, x);
+        v.insert(1usize, y);
         Vec2 { inner: v }
     }
 
     pub fn x(self) -> f32 {
-        self.inner.extract(0)
+        self.inner.extract(0usize)
     }
     pub fn y(self) -> f32 {
-        self.inner.extract(1)
+        self.inner.extract(1usize)
     }
 
     pub fn add(self, other: Vec2) -> Vec2 {
@@ -151,29 +150,29 @@ pub struct Quat {
 impl Quat {
     pub fn new(w: f32, x: f32, y: f32, z: f32) -> Quat {
         let mut v = Vector::<f32, Const<4>>::empty();
-        v.insert(0, w);
-        v.insert(1, x);
-        v.insert(2, y);
-        v.insert(3, z);
+        v.insert(0usize, w);
+        v.insert(1usize, x);
+        v.insert(2usize, y);
+        v.insert(3usize, z);
         Quat { inner: v }
     }
 
     pub fn w(self) -> f32 {
-        self.inner.extract(0)
+        self.inner.extract(0usize)
     }
     pub fn x(self) -> f32 {
-        self.inner.extract(1)
+        self.inner.extract(1usize)
     }
     pub fn y(self) -> f32 {
-        self.inner.extract(2)
+        self.inner.extract(2usize)
     }
     pub fn z(self) -> f32 {
-        self.inner.extract(3)
+        self.inner.extract(3usize)
     }
 
     pub fn dot(self, other: Quat) -> f32 {
         let p = self.inner * other.inner;
-        p.extract(0) + p.extract(1) + p.extract(2) + p.extract(3)
+        p.extract(0usize) + p.extract(1usize) + p.extract(2usize) + p.extract(3usize)
     }
 
     pub fn scale(self, s: f32) -> Quat {
@@ -367,11 +366,6 @@ impl Mat2x3 {
             c12: self.c1.dot(sc2),
             c22: self.c2.dot(sc2),
         }
-    }
-
-    /// `M^T * v`.
-    pub fn transpose_mul_vec2(self, v: Vec2) -> Vec3A {
-        self.row0().scale(v.x()).add(self.row1().scale(v.y()))
     }
 
     pub fn gram_matrix(self) -> Sym2 {

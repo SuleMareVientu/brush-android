@@ -208,14 +208,7 @@ impl App {
             .as_ref()
             .expect("Must use wgpu to render UI.");
 
-        let burn_device = brush_process::burn_init_device(
-            state.adapter.clone(),
-            state.device.clone(),
-            state.queue.clone(),
-        );
-
-        log::info!("Connecting context to Burn device & GUI context.");
-        let context = std::sync::Arc::new(UiProcess::new(burn_device, cc.egui_ctx.clone()));
+        let context = std::sync::Arc::new(UiProcess::new(cc.egui_ctx.clone()));
 
         if let Some(process) = init_process {
             context.connect_to_process(process);
@@ -395,7 +388,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style().as_ref()).inner_margin(0.0))
-            .show_inside(ui, |ui| self.tree.ui(&mut self.tree_ctx, ui));
+            .show(ui, |ui| self.tree.ui(&mut self.tree_ctx, ui));
 
         if ui.ctx().input(|i| i.key_pressed(egui::Key::F)) && !ui.ctx().egui_wants_keyboard_input()
         {

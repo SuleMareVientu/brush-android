@@ -1,19 +1,12 @@
 use burn::tensor::{DType, Scalar, Shape};
-use burn_wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime};
 use bytemuck::Pod;
 
-pub use burn_cubecl::cubecl::prelude::KernelId;
-use burn_cubecl::cubecl::server::MetadataBindingInfo;
-pub use burn_cubecl::cubecl::{CubeCount, CubeDim, client::ComputeClient, server::ComputeServer};
-pub use burn_cubecl::cubecl::{CubeTask, Runtime};
-pub use burn_cubecl::{CubeRuntime, tensor::CubeTensor};
-
-use bytemuck::NoUninit;
+pub use burn::cubecl::prelude::KernelId;
+pub use burn::cubecl::{CubeCount, CubeDim, client::Client};
+pub use burn_cubecl::{CubeDevice, tensor::CubeTensor};
 
 // Re-export bytemuck for use by generated code
 pub use bytemuck;
-
-use crate::MainBackendBase;
 
 /// Calculate workgroup count for a 1D dispatch, tiling into 2D if needed.
 /// Use this for kernels processing a 1D array of elements that may exceed 65535 workgroups.
@@ -30,20 +23,13 @@ pub fn calc_cube_count_1d(num_elements: u32, workgroup_size: u32) -> CubeCount {
     }
 }
 
-pub fn calc_cube_count_3d(sizes: [u32; 3], workgroup_size: [u32; 3]) -> CubeCount {
-    let wg_x = sizes[0].div_ceil(workgroup_size[0]);
-    let wg_y = sizes[1].div_ceil(workgroup_size[1]);
-    let wg_z = sizes[2].div_ceil(workgroup_size[2]);
-    CubeCount::Static(wg_x, wg_y, wg_z)
-}
-
 // Reserve a buffer from the client for the given shape.
 pub fn create_tensor<const D: usize>(
     shape: [usize; D],
-    device: &WgpuDevice,
+    device: &CubeDevice,
     dtype: DType,
-) -> CubeTensor<WgpuRuntime> {
-    let client = WgpuRuntime::client(device);
+) -> CubeTensor {
+    let client = device.client();
 
     let shape = Shape::from(shape.to_vec());
     let bufsize = shape.num_elements() * dtype.size();
@@ -60,7 +46,7 @@ pub fn create_tensor<const D: usize>(
             buffer,
             DType::F32,
         );
-        let noised = MainBackendBase::float_add_scalar(f, Scalar::Float(-12345.0));
+        let noised = burn_cubecl::CubeBackend::float_add_scalar(f, Scalar::Float(-12345.0));
         buffer = noised.handle;
     }
     CubeTensor::new_contiguous(client, device.clone(), shape, buffer, dtype)
@@ -69,10 +55,10 @@ pub fn create_tensor<const D: usize>(
 /// Upload a slice of POD data to the GPU as a 1D `CubeTensor`.
 pub fn create_tensor_from_slice<T: Pod>(
     data: &[T],
-    device: &WgpuDevice,
+    device: &CubeDevice,
     dtype: DType,
-) -> CubeTensor<WgpuRuntime<AutoCompiler>> {
-    let client = WgpuRuntime::client(device);
+) -> CubeTensor {
+    let client = device.client();
     let handle = client.create_from_slice(bytemuck::cast_slice(data));
     CubeTensor::new_contiguous(
         client,
@@ -80,28 +66,5 @@ pub fn create_tensor_from_slice<T: Pod>(
         Shape::new([data.len()]),
         handle,
         dtype,
-    )
-}
-
-pub fn create_meta_binding<T: NoUninit>(val: T) -> MetadataBindingInfo {
-    // Copy data to u64. If length of T is not % 8, this will correctly
-    // pad with zeros.
-    let data: Vec<u64> = bytemuck::pod_collect_to_vec(&[val]);
-    MetadataBindingInfo::new(data, 0)
-}
-
-/// Create a buffer to use as a shader uniform, from a structure.
-pub fn create_uniform_buffer<R: CubeRuntime, T: NoUninit>(
-    val: T,
-    device: &R::Device,
-    client: &ComputeClient<R>,
-) -> CubeTensor<R> {
-    let binding = create_meta_binding(val);
-    CubeTensor::new_contiguous(
-        client.clone(),
-        device.clone(),
-        Shape::new([binding.data.len()]),
-        client.create_from_slice(bytemuck::cast_slice(&binding.data)),
-        DType::I32,
     )
 }

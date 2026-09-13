@@ -1,4 +1,4 @@
-use crate::camera::calculate_jacobian_clamp_limits;
+use crate::camera::{calculate_jacobian_clamp_limits, max_render_theta};
 use crate::{
     RenderAuxInner, SplatOps,
     camera::Camera,
@@ -10,18 +10,18 @@ use crate::{
     sh::sh_degree_from_coeffs,
     shaders,
 };
+use brush_cube::calc_cube_count_1d;
 use brush_cube::create_tensor;
-use brush_cube::{MainBackendBase, calc_cube_count_1d};
 use brush_prefix_sum::prefix_sum;
 use brush_sort::radix_argsort;
 use burn::backend::TensorMetadata;
 use burn::backend::ops::TransactionPrimitive;
 use burn::backend::ops::{FloatTensorOps, IntTensorOps, TransactionOps};
 use burn::backend::tensor::FloatTensor;
+use burn::cubecl::CubeDim;
 use burn::tensor::{DType, FloatDType, IntDType};
-use burn_cubecl::cubecl::CubeDim;
+use burn_cubecl::CubeBackend;
 use burn_cubecl::kernel::into_contiguous;
-use burn_wgpu::WgpuRuntime;
 use glam::{Vec3, uvec2};
 use kernels::types::RasterizeUniformsLaunch;
 use std::f32::consts::PI;
@@ -34,7 +34,7 @@ pub fn calc_tile_bounds(img_size: glam::UVec2) -> glam::UVec2 {
     )
 }
 
-impl SplatOps for MainBackendBase {
+impl SplatOps for CubeBackend {
     #[allow(clippy::too_many_arguments)]
     async fn render(
         camera: &Camera,
@@ -42,6 +42,7 @@ impl SplatOps for MainBackendBase {
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
+        _refine_weight: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: RasterPass,
@@ -66,8 +67,12 @@ impl SplatOps for MainBackendBase {
         let sh_degree = sh_degree_from_coeffs(sh_coeffs.shape()[1] as u32);
         let mip_splat = matches!(render_mode, SplatRenderMode::Mip);
 
+        // Cull splats beyond the lens' diagonal fov with some margin, but never
+        // past the angle where the distortion polynomial folds back on itself:
+        // those would project mirrored into the image with huge radii.
         let half_max_render_fov =
-            ((camera.fov_x as f32).hypot(camera.fov_y as f32) * 1.05).min(2.0 * PI - 1e-6) * 0.5;
+            (((camera.fov_x as f32).hypot(camera.fov_y as f32) * 1.05).min(2.0 * PI - 1e-6) * 0.5)
+                .min(max_render_theta(&camera.camera_model) as f32);
         let pinhole_params = camera.build_pinhole_params(img_size);
 
         let mut project_uniforms = shaders::helpers::ProjectUniforms {
@@ -113,7 +118,7 @@ impl SplatOps for MainBackendBase {
 
             let uniforms = project_uniforms.to_launch_object();
 
-            kernels::project_forward::project_forward_kernel::launch::<WgpuRuntime>(
+            kernels::project_forward::project_forward_kernel::launch(
                 &client,
                 calc_cube_count_1d(
                     project_uniforms.total_splats,
@@ -157,11 +162,11 @@ impl SplatOps for MainBackendBase {
                 .expect("Failed to read counts");
             let num_visible = data.read_ints[0]
                 .clone()
-                .into_vec::<u32>()
+                .try_into_vec::<u32>()
                 .expect("num_visible")[0];
             let num_intersections = data.read_ints[1]
                 .clone()
-                .into_vec::<u32>()
+                .try_into_vec::<u32>()
                 .expect("num_intersections")[0];
             (num_visible, num_intersections)
         };
@@ -191,7 +196,7 @@ impl SplatOps for MainBackendBase {
         );
         tracing::trace_span!("ProjectVisible").in_scope(|| {
             let uniforms = project_uniforms.to_launch_object();
-            kernels::project_visible::project_visible_kernel::launch::<WgpuRuntime>(
+            kernels::project_visible::project_visible_kernel::launch(
                 &client,
                 calc_cube_count_1d(num_visible, kernels::project_visible::WG_SIZE),
                 CubeDim::new_1d(kernels::project_visible::WG_SIZE),
@@ -211,7 +216,7 @@ impl SplatOps for MainBackendBase {
         let tile_id_from_isect = create_tensor([buffer_size], &device, DType::U32);
         let compact_gid_from_isect = create_tensor([buffer_size], &device, DType::U32);
         tracing::trace_span!("MapGaussiansToIntersect").in_scope(|| {
-            kernels::map_gaussians::map_gaussians_to_intersect_kernel::launch::<WgpuRuntime>(
+            kernels::map_gaussians::map_gaussians_to_intersect_kernel::launch(
                 &client,
                 calc_cube_count_1d(num_visible, kernels::map_gaussians::WG_SIZE),
                 CubeDim::new_1d(kernels::map_gaussians::WG_SIZE),
@@ -234,7 +239,7 @@ impl SplatOps for MainBackendBase {
             IntDType::U32,
         );
         tracing::trace_span!("GetTileOffsets").in_scope(|| {
-            get_tile_offsets::launch::<WgpuRuntime>(
+            get_tile_offsets::launch(
                 &client,
                 calc_cube_count_1d(num_intersections, cube_dim.x * CHECKS_PER_ITER),
                 cube_dim,
@@ -273,7 +278,7 @@ impl SplatOps for MainBackendBase {
                 background.y,
                 background.z,
             );
-            kernels::rasterize::rasterize_kernel::launch::<WgpuRuntime>(
+            kernels::rasterize::rasterize_kernel::launch(
                 &client,
                 calc_cube_count_1d(
                     num_tiles * (shaders::helpers::TILE_WIDTH * shaders::helpers::TILE_WIDTH),
@@ -288,6 +293,9 @@ impl SplatOps for MainBackendBase {
                 global_from_compact_gid.clone().into_tensor_arg(),
                 visible.clone().into_tensor_arg(),
                 uniforms,
+                // Precomputed divisor for the tiles-per-row split in the
+                // per-pixel index math.
+                project_uniforms.tile_bounds[0],
                 bwd_info,
                 smooth_cutoff,
             );

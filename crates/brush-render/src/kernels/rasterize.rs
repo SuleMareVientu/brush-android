@@ -11,9 +11,10 @@
 //! outer loop ends early. When `bwd_info=false` the kernel writes a
 //! packed u8x4 to `out_img` and skips the backward bookkeeping.
 
-use burn_cubecl::cubecl;
-use burn_cubecl::cubecl::cube;
-use burn_cubecl::cubecl::prelude::*;
+use burn::cubecl;
+use burn::cubecl::cube;
+use burn::cubecl::prelude::*;
+use burn::cubecl::std::FastDivmod;
 
 use super::helpers::{
     ALPHA_CUTOFF_MID, PROJECTED_LANES, PROJECTED_LANES_USIZE, TILE_SIZE, TILE_WIDTH,
@@ -32,11 +33,12 @@ pub fn rasterize_kernel(
     global_from_compact_gid: &Tensor<u32>,
     visible: &mut Tensor<f32>,
     u: RasterizeUniforms,
+    tile_bw_div: FastDivmod<u32>,
     #[comptime] bwd_info: bool,
     #[comptime] smooth_cutoff: bool,
 ) {
     let global_id = ABSOLUTE_POS as u32;
-    let (pix_x, pix_y) = map_1d_to_2d(global_id, u.tile_bw);
+    let (pix_x, pix_y) = map_1d_to_2d(global_id, tile_bw_div);
     let pix_id = pix_x + pix_y * u.img_w;
     let pixel_coord_x = pix_x as f32 + 0.5f32;
     let pixel_coord_y = pix_y as f32 + 0.5f32;

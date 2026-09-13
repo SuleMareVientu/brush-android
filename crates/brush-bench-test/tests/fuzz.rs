@@ -16,7 +16,7 @@
 //! tests run on `Autodiff<MainBackend>` (via fusion), exercising the
 //! gradient kernels.
 
-use brush_cube::{MainBackendBase, Runtime};
+use brush_cube::{CubeDevice, MainBackendBase};
 use brush_render::{
     RenderOutput, SplatOps,
     camera::Camera,
@@ -27,7 +27,6 @@ use brush_render::{
 use burn::backend::wgpu::WgpuDevice;
 use burn::tensor::DType;
 use burn_cubecl::tensor::CubeTensor;
-use burn_wgpu::WgpuRuntime;
 use std::num::Wrapping;
 
 struct Sm64(Wrapping<u64>);
@@ -147,16 +146,13 @@ fn finite_scene(seed: u64, n: usize) -> Scene {
     (means, rots, ls, dc, opac)
 }
 
-fn cube_tensor<const D: usize>(
-    device: &WgpuDevice,
-    shape: [usize; D],
-    data: &[f32],
-) -> CubeTensor<WgpuRuntime> {
-    let client = WgpuRuntime::client(device);
+fn cube_tensor<const D: usize>(device: &WgpuDevice, shape: [usize; D], data: &[f32]) -> CubeTensor {
+    let device = CubeDevice::Wgpu(device.clone());
+    let client = device.client();
     let handle = client.create_from_slice(bytemuck::cast_slice(data));
     CubeTensor::new_contiguous(
         client,
-        device.clone(),
+        device,
         burn::tensor::Shape::new(shape),
         handle,
         DType::F32,
@@ -184,6 +180,8 @@ async fn render_raw(
         cube_tensor(device, [n, 10], &transforms),
         cube_tensor(device, [n, 1, 3], dc),
         cube_tensor(device, [n], opac),
+        // Unused on the non-autodiff path.
+        cube_tensor(device, [1], &[0.0]),
         mode,
         glam::Vec3::ZERO,
         brush_render::gaussian_splats::RasterPass::Forward,
@@ -506,7 +504,8 @@ async fn fuzz_bwd_random_scenes_gradients_are_finite() {
         let device_d = burn::tensor::Device::from(device.clone()).autodiff();
         let splats = Splats::from_raw(means, rots, ls, dc, opac, mode, &device_d);
         let diff =
-            brush_render_bwd::render_splats(splats.clone(), &cam, img_size, glam::Vec3::ZERO).await;
+            brush_render::bwd::render_splats(splats.clone(), &cam, img_size, glam::Vec3::ZERO)
+                .await;
         splats.bwd_validate(diff.img.mean()).await;
     }
 }
@@ -542,7 +541,7 @@ async fn fuzz_bwd_extreme_inputs_stay_finite() {
                 &device_d,
             );
             let diff =
-                brush_render_bwd::render_splats(splats.clone(), &cam, img_size, glam::Vec3::ZERO)
+                brush_render::bwd::render_splats(splats.clone(), &cam, img_size, glam::Vec3::ZERO)
                     .await;
             splats.bwd_validate(diff.img.mean()).await;
         }

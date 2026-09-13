@@ -28,13 +28,13 @@ version = 2
 ignore = [
     # Paste is unmaintained, used by Cube and rerun, wait for them to upgrade.
     "RUSTSEC-2024-0436",
-    # bincode is unmaintained, used by Cube and rerun, wait for them to upgrade.
-    "RUSTSEC-2025-0141",
     # ttf-parser is unmaintained, used transitively by winit.
     "RUSTSEC-2026-0192",
 ]
 
 [bans]
+# Keep flate2 at 1.1.9 in Cargo.lock: 1.1.10 adds a second miniz_oxide version.
+# After updating dependencies, run `cargo update -p flate2 --precise 1.1.9`.
 multiple-versions = "deny"
 deny = [
     { name = "openssl-sys", reason = "Use rustls" },
@@ -58,6 +58,18 @@ skip = [
 
     { name = 'thiserror' },
     { name = 'thiserror-impl' },
+
+    # syn 2 -> 3 ecosystem transition (async-trait is on 3, most derives on 2).
+    { name = 'syn' },
+
+    # pliron (via cubecl) is on downcast-rs 2, wayland-backend still on 1.
+    { name = 'downcast-rs' },
+
+    # rerun's re_auth is on base64 0.23, arrow/reqwest/tonic still on 0.22.
+    { name = 'base64' },
+
+    # eframe 0.36 moved to pollster 1.0, rfd (latest 0.17.2) still on 0.4.
+    { name = 'pollster' },
 
     # Other
     { name = "core-foundation" },     # Egui has two?

@@ -10,15 +10,14 @@
 //!   with optional background-compositing of GT (`gt_eff = gt + (1 - gt.a) * bg`)
 //!   and optional mask multiplication (`out = out * gt.a`) folded into the kernel.
 //! - [`image_loss_eval`]: forward-only loss map for non-differentiable backends.
+//! - [`psnr_from_mse`] / [`psnr`]: PSNR in dB, with MSE floored so identical
+//!   images report 100 dB rather than infinity.
 //!
 //! Backward recomputes SSIM partials inline so no per-pixel state survives
 //! across the autograd tape.
 
-use brush_cube::{MainBackend, MainBackendBase};
-use brush_render::burn_glue::{
-    AutodiffMain, unwrap_ad_wgpu_float, unwrap_ad_wgpu_int, unwrap_wgpu_float, unwrap_wgpu_int,
-    wrap_ad_wgpu_float, wrap_wgpu_float,
-};
+use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
+use burn::backend::{Autodiff, AutodiffBackend};
 use burn::{
     backend::{
         Backend, TensorMetadata,
@@ -28,26 +27,25 @@ use burn::{
             ops::{Backward, Ops, OpsKind},
         },
         tensor::{FloatTensor, IntTensor},
-        wgpu::WgpuRuntime,
     },
     tensor::{DType, Int, Shape, Tensor},
 };
 use burn_cubecl::{
-    CubeRuntime, fusion::FusionCubeRuntime, kernel::into_contiguous, tensor::CubeTensor,
+    CubeBackend, fusion::FusionCubeRuntime, kernel::into_contiguous, tensor::CubeTensor,
 };
 use burn_fusion::{
-    Fusion, FusionHandle,
+    ExecutionError, Fusion, FusionHandle,
     stream::{Operation, StreamId},
 };
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use glam::Vec3;
 
 mod kernels {
-    use burn_cubecl::cubecl;
-    use burn_cubecl::cubecl::cube;
-    use burn_cubecl::cubecl::frontend::CompilationArg;
-    use burn_cubecl::cubecl::frontend::IndexMutExpand;
-    use burn_cubecl::cubecl::prelude::*;
+    use burn::cubecl;
+    use burn::cubecl::cube;
+    use burn::cubecl::frontend::CompilationArg;
+    use burn::cubecl::frontend::IndexMutExpand;
+    use burn::cubecl::prelude::*;
 
     /// 11-tap Gaussian weights at sigma = 1.5, normalised to sum to 1.
     /// Called from `comptime!` so it runs once per kernel build, baking each
@@ -715,25 +713,26 @@ pub struct ImageLossConfig {
 /// `c == 3` workgroup of `image_loss_*` runs the alpha-match path
 /// (`|pred.a - gt.a|`) instead of SSIM + L1 — folding the previously-separate
 /// alpha-match kernel into the same launch.
-pub trait LossOps<B: Backend> {
-    fn image_loss_forward(
-        pred: FloatTensor<B>,
-        gt_packed: IntTensor<B>,
+#[burn::backend::backend_extension(Cube, Autodiff)]
+pub trait LossOps: Backend {
+    fn image_loss(
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
         cfg: ImageLossConfig,
-    ) -> FloatTensor<B>;
+    ) -> FloatTensor<Self>;
 
     fn image_loss_backward(
-        pred: FloatTensor<B>,
-        gt_packed: IntTensor<B>,
-        dl_dmap: FloatTensor<B>,
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
+        dl_dmap: FloatTensor<Self>,
         cfg: ImageLossConfig,
-    ) -> FloatTensor<B>;
+    ) -> FloatTensor<Self>;
 
-    fn unpack_gt_rgb(gt_packed: IntTensor<B>, composite_bg: Option<Vec3>) -> FloatTensor<B>;
+    fn unpack_gt_rgb(gt_packed: IntTensor<Self>, composite_bg: Option<Vec3>) -> FloatTensor<Self>;
 }
 
-fn alloc_zeros<R: CubeRuntime>(template: &CubeTensor<R>) -> CubeTensor<R> {
-    burn_cubecl::ops::numeric::zeros_client::<R>(
+fn alloc_zeros(template: &CubeTensor) -> CubeTensor {
+    burn_cubecl::ops::numeric::zeros_client(
         template.client.clone(),
         template.device.clone(),
         Shape::from(template.shape().as_slice().to_vec()),
@@ -741,9 +740,9 @@ fn alloc_zeros<R: CubeRuntime>(template: &CubeTensor<R>) -> CubeTensor<R> {
     )
 }
 
-/// Wraps a closure as a fusion `Operation`. Lets each fusion-side method on
-/// `LossOps` skip its own `struct CustomOp` + `impl Operation` boilerplate;
-/// the closure captures whatever extra config it needs.
+type FusionHandles = HandleContainer<FusionHandle<FusionCubeRuntime>>;
+type FusionTensor = burn_fusion::FusionTensor<FusionCubeRuntime>;
+
 struct ClosureOp<F> {
     desc: CustomOpIr,
     op: F,
@@ -755,34 +754,25 @@ impl<F> std::fmt::Debug for ClosureOp<F> {
     }
 }
 
-impl<F> Operation<FusionCubeRuntime<WgpuRuntime>> for ClosureOp<F>
+impl<F> Operation<FusionCubeRuntime> for ClosureOp<F>
 where
-    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>)
-        + Send
-        + Sync
-        + 'static,
+    F: Fn(&CustomOpIr, &mut FusionHandles) + Send + Sync + 'static,
 {
-    fn execute(&self, h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>) {
+    fn execute(&self, h: &mut FusionHandles) -> Result<(), ExecutionError> {
         (self.op)(&self.desc, h);
+        Ok(())
     }
 }
 
-/// Register a custom op on the Fusion stream. Each input/output is a fusion
-/// `FusionTensor` (Float and Int both lower to the same primitive on this
-/// backend), and `op` is the closure that runs against the inner backend
-/// when fusion eventually executes the queued op.
-fn dispatch_custom<const N: usize, F>(
+fn register_custom<const N: usize, F>(
     name: &'static str,
-    inputs: [burn_fusion::FusionTensor<FusionCubeRuntime<WgpuRuntime>>; N],
+    inputs: [FusionTensor; N],
     out_shape: Shape,
     out_dtype: DType,
     op: F,
-) -> burn_fusion::FusionTensor<FusionCubeRuntime<WgpuRuntime>>
+) -> FusionTensor
 where
-    F: Fn(&CustomOpIr, &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>)
-        + Send
-        + Sync
-        + 'static,
+    F: Fn(&CustomOpIr, &mut FusionHandles) + Send + Sync + 'static,
 {
     let client = inputs[0].client.clone();
     let out = TensorIr::uninit(client.create_empty_handle(), out_shape, out_dtype);
@@ -798,8 +788,8 @@ where
     out
 }
 
-fn cube_count_3d(c: u32, h: u32, w: u32) -> burn_cubecl::cubecl::prelude::CubeCount {
-    use burn_cubecl::cubecl::prelude::CubeCount;
+fn cube_count_3d(c: u32, h: u32, w: u32) -> burn::cubecl::prelude::CubeCount {
+    use burn::cubecl::prelude::CubeCount;
     CubeCount::Static(
         w.div_ceil(kernels::BLOCK_X),
         h.div_ceil(kernels::BLOCK_Y),
@@ -807,8 +797,8 @@ fn cube_count_3d(c: u32, h: u32, w: u32) -> burn_cubecl::cubecl::prelude::CubeCo
     )
 }
 
-fn cube_count_3d_bwd(c: u32, h: u32, w: u32) -> burn_cubecl::cubecl::prelude::CubeCount {
-    use burn_cubecl::cubecl::prelude::CubeCount;
+fn cube_count_3d_bwd(c: u32, h: u32, w: u32) -> burn::cubecl::prelude::CubeCount {
+    use burn::cubecl::prelude::CubeCount;
     CubeCount::Static(
         w.div_ceil(kernels::BLOCK_X_BWD),
         h.div_ceil(kernels::BLOCK_Y_BWD),
@@ -816,12 +806,12 @@ fn cube_count_3d_bwd(c: u32, h: u32, w: u32) -> burn_cubecl::cubecl::prelude::Cu
     )
 }
 
-fn launch_image_forward<R: CubeRuntime>(
-    pred: CubeTensor<R>,
-    gt_packed: CubeTensor<R>,
+fn launch_image_forward(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
     cfg: ImageLossConfig,
-) -> CubeTensor<R> {
-    use burn_cubecl::cubecl::prelude::CubeDim;
+) -> CubeTensor {
+    use burn::cubecl::prelude::CubeDim;
 
     let pred = into_contiguous(pred);
     let gt_packed = into_contiguous(gt_packed);
@@ -843,7 +833,7 @@ fn launch_image_forward<R: CubeRuntime>(
     let bg = cfg.composite_bg.unwrap_or(Vec3::ZERO);
     let map = alloc_zeros(&pred);
     let client = pred.client.clone();
-    kernels::image_loss_forward_kernel::launch::<f32, R>(
+    kernels::image_loss_forward_kernel::launch::<f32>(
         &client,
         cube_count_3d(c, h, w),
         CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
@@ -863,13 +853,13 @@ fn launch_image_forward<R: CubeRuntime>(
     map
 }
 
-fn launch_image_backward<R: CubeRuntime>(
-    pred: CubeTensor<R>,
-    gt_packed: CubeTensor<R>,
-    dl_dmap: CubeTensor<R>,
+fn launch_image_backward(
+    pred: CubeTensor,
+    gt_packed: CubeTensor,
+    dl_dmap: CubeTensor,
     cfg: ImageLossConfig,
-) -> CubeTensor<R> {
-    use burn_cubecl::cubecl::prelude::CubeDim;
+) -> CubeTensor {
+    use burn::cubecl::prelude::CubeDim;
 
     let pred = into_contiguous(pred);
     let gt_packed = into_contiguous(gt_packed);
@@ -883,7 +873,7 @@ fn launch_image_backward<R: CubeRuntime>(
     let dl_dpred = alloc_zeros(&pred);
     let client = pred.client.clone();
 
-    kernels::image_loss_backward_kernel::launch::<f32, R>(
+    kernels::image_loss_backward_kernel::launch::<f32>(
         &client,
         cube_count_3d_bwd(c, h, w),
         CubeDim::new_2d(kernels::BLOCK_X_BWD, kernels::BLOCK_Y_BWD),
@@ -904,12 +894,9 @@ fn launch_image_backward<R: CubeRuntime>(
     dl_dpred
 }
 
-fn launch_unpack_gt_rgb<R: CubeRuntime>(
-    gt_packed: CubeTensor<R>,
-    composite_bg: Option<Vec3>,
-) -> CubeTensor<R> {
+fn launch_unpack_gt_rgb(gt_packed: CubeTensor, composite_bg: Option<Vec3>) -> CubeTensor {
+    use burn::cubecl::prelude::{CubeCount, CubeDim};
     use burn::tensor::{DType, Shape};
-    use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
 
     let gt_packed = into_contiguous(gt_packed);
     let dims = gt_packed.shape().as_slice().to_vec();
@@ -919,7 +906,7 @@ fn launch_unpack_gt_rgb<R: CubeRuntime>(
     let bg = composite_bg.unwrap_or(Vec3::ZERO);
 
     let client = gt_packed.client.clone();
-    let out = burn_cubecl::ops::numeric::zeros_client::<R>(
+    let out = burn_cubecl::ops::numeric::zeros_client(
         client.clone(),
         gt_packed.device.clone(),
         Shape::new([h as usize, w as usize, 3]),
@@ -930,7 +917,7 @@ fn launch_unpack_gt_rgb<R: CubeRuntime>(
         h.div_ceil(kernels::BLOCK_Y),
         1,
     );
-    kernels::unpack_gt_rgb_kernel::launch::<f32, R>(
+    kernels::unpack_gt_rgb_kernel::launch::<f32>(
         &client,
         cube_count,
         CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y),
@@ -946,8 +933,8 @@ fn launch_unpack_gt_rgb<R: CubeRuntime>(
     out
 }
 
-impl LossOps<Self> for MainBackendBase {
-    fn image_loss_forward(
+impl LossOps for CubeBackend {
+    fn image_loss(
         pred: FloatTensor<Self>,
         gt_packed: IntTensor<Self>,
         cfg: ImageLossConfig,
@@ -969,26 +956,26 @@ impl LossOps<Self> for MainBackendBase {
     }
 }
 
-impl LossOps<Self> for Fusion<MainBackendBase> {
-    fn image_loss_forward(
+impl LossOps for Fusion<CubeBackend> {
+    fn image_loss(
         pred: FloatTensor<Self>,
         gt_packed: IntTensor<Self>,
         cfg: ImageLossConfig,
     ) -> FloatTensor<Self> {
         let shape = pred.shape();
-        dispatch_custom(
-            "image_loss_forward",
+        register_custom(
+            "image_loss",
             [pred, gt_packed],
             shape,
             DType::F32,
             move |desc, h| {
                 let ([pred, gt_packed], [map]) = desc.as_fixed();
-                let out = MainBackendBase::image_loss_forward(
-                    h.get_float_tensor::<MainBackendBase>(pred),
-                    h.get_int_tensor::<MainBackendBase>(gt_packed),
+                let out = <CubeBackend as LossOps>::image_loss(
+                    h.get_float_tensor::<CubeBackend>(pred),
+                    h.get_int_tensor::<CubeBackend>(gt_packed),
                     cfg,
                 );
-                h.register_float_tensor::<MainBackendBase>(&map.id, out);
+                h.register_float_tensor::<CubeBackend>(&map.id, out);
             },
         )
     }
@@ -1000,38 +987,38 @@ impl LossOps<Self> for Fusion<MainBackendBase> {
         cfg: ImageLossConfig,
     ) -> FloatTensor<Self> {
         let shape = pred.shape();
-        dispatch_custom(
+        register_custom(
             "image_loss_backward",
             [pred, gt_packed, dl_dmap],
             shape,
             DType::F32,
             move |desc, h| {
                 let ([pred, gt_packed, dl_dmap], [dl_dpred]) = desc.as_fixed();
-                let out = MainBackendBase::image_loss_backward(
-                    h.get_float_tensor::<MainBackendBase>(pred),
-                    h.get_int_tensor::<MainBackendBase>(gt_packed),
-                    h.get_float_tensor::<MainBackendBase>(dl_dmap),
+                let out = <CubeBackend as LossOps>::image_loss_backward(
+                    h.get_float_tensor::<CubeBackend>(pred),
+                    h.get_int_tensor::<CubeBackend>(gt_packed),
+                    h.get_float_tensor::<CubeBackend>(dl_dmap),
                     cfg,
                 );
-                h.register_float_tensor::<MainBackendBase>(&dl_dpred.id, out);
+                h.register_float_tensor::<CubeBackend>(&dl_dpred.id, out);
             },
         )
     }
 
     fn unpack_gt_rgb(gt_packed: IntTensor<Self>, composite_bg: Option<Vec3>) -> FloatTensor<Self> {
         let [gh, gw] = gt_packed.shape().dims();
-        dispatch_custom(
+        register_custom(
             "unpack_gt_rgb",
             [gt_packed],
             Shape::new([gh, gw, 3]),
             DType::F32,
             move |desc, h| {
                 let ([gt_packed], [out]) = desc.as_fixed();
-                let res = MainBackendBase::unpack_gt_rgb(
-                    h.get_int_tensor::<MainBackendBase>(gt_packed),
+                let res = <CubeBackend as LossOps>::unpack_gt_rgb(
+                    h.get_int_tensor::<CubeBackend>(gt_packed),
                     composite_bg,
                 );
-                h.register_float_tensor::<MainBackendBase>(&out.id, res);
+                h.register_float_tensor::<CubeBackend>(&out.id, res);
             },
         )
     }
@@ -1047,7 +1034,7 @@ struct ImageLossState<B: Backend> {
     cfg: ImageLossConfig,
 }
 
-impl<B: Backend + LossOps<B>> Backward<B, 1> for ImageLossBackward {
+impl<B: Backend + LossOps> Backward<B, 1> for ImageLossBackward {
     type State = ImageLossState<B>;
 
     fn backward(
@@ -1074,33 +1061,61 @@ impl<B: Backend + LossOps<B>> Backward<B, 1> for ImageLossBackward {
 /// `pred` must be on an autodiff-enabled Wgpu device.
 pub fn image_loss(pred: Tensor<3>, gt_packed: Tensor<2, Int>, cfg: ImageLossConfig) -> Tensor<3> {
     let pred_chw = pred.permute([2, 0, 1]);
-    let pred_ad = unwrap_ad_wgpu_float(pred_chw);
-    let gt_p = unwrap_ad_wgpu_int(gt_packed);
-
-    let prep = ImageLossBackward
-        .prepare::<NoCheckpointing>([pred_ad.node.clone()])
-        .compute_bound()
-        .stateful();
-
-    let pred_p = pred_ad.primitive;
-    let map = <MainBackend as LossOps<MainBackend>>::image_loss_forward(
-        pred_p.clone(),
-        gt_p.clone(),
+    let map = <burn::backend::Dispatch as LossOps>::image_loss(
+        pred_chw.into_dispatch(),
+        gt_packed.into_dispatch(),
         cfg,
     );
+    Tensor::<3>::from_dispatch(map).permute([1, 2, 0])
+}
 
-    let map_ad: FloatTensor<AutodiffMain> = match prep {
-        OpsKind::Tracked(prep) => prep.finish(
-            ImageLossState {
-                pred: pred_p,
-                gt_packed: gt_p,
-                cfg,
-            },
-            map,
-        ),
-        OpsKind::UnTracked(prep) => prep.finish(map),
-    };
-    wrap_ad_wgpu_float::<3>(map_ad).permute([1, 2, 0])
+impl<B: Backend + LossOps, C: CheckpointStrategy> LossOps for Autodiff<B, C> {
+    fn image_loss(
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
+        cfg: ImageLossConfig,
+    ) -> FloatTensor<Self> {
+        let prep = ImageLossBackward
+            .prepare::<NoCheckpointing>([pred.node.clone()])
+            .compute_bound()
+            .stateful();
+
+        let pred_p = pred.primitive;
+        let map = <B as LossOps>::image_loss(pred_p.clone(), gt_packed.clone(), cfg);
+
+        match prep {
+            OpsKind::Tracked(prep) => prep.finish(
+                ImageLossState {
+                    pred: pred_p,
+                    gt_packed,
+                    cfg,
+                },
+                map,
+            ),
+            OpsKind::UnTracked(prep) => prep.finish(map),
+        }
+    }
+
+    fn image_loss_backward(
+        pred: FloatTensor<Self>,
+        gt_packed: IntTensor<Self>,
+        dl_dmap: FloatTensor<Self>,
+        cfg: ImageLossConfig,
+    ) -> FloatTensor<Self> {
+        <Self as AutodiffBackend>::from_inner(<B as LossOps>::image_loss_backward(
+            pred.primitive,
+            gt_packed,
+            dl_dmap.primitive,
+            cfg,
+        ))
+    }
+
+    fn unpack_gt_rgb(gt_packed: IntTensor<Self>, composite_bg: Option<Vec3>) -> FloatTensor<Self> {
+        <Self as AutodiffBackend>::from_inner(<B as LossOps>::unpack_gt_rgb(
+            gt_packed,
+            composite_bg,
+        ))
+    }
 }
 
 /// Forward-only loss map for non-differentiable backends. Same kernel as
@@ -1112,10 +1127,26 @@ pub fn image_loss_eval(
     cfg: ImageLossConfig,
 ) -> Tensor<3> {
     let pred_chw = pred.permute([2, 0, 1]);
-    let pred_p = unwrap_wgpu_float(pred_chw);
-    let gt_p = unwrap_wgpu_int(gt_packed);
-    let map = <MainBackend as LossOps<MainBackend>>::image_loss_forward(pred_p, gt_p, cfg);
-    wrap_wgpu_float::<3>(map).permute([1, 2, 0])
+    let map = <burn::backend::Dispatch as LossOps>::image_loss(
+        pred_chw.into_dispatch(),
+        gt_packed.into_dispatch(),
+        cfg,
+    );
+    Tensor::<3>::from_dispatch(map).permute([1, 2, 0])
+}
+
+/// Smallest MSE PSNR distinguishes: identical images report 100 dB instead
+/// of infinity, which would poison any average or plot it feeds.
+const PSNR_MIN_MSE: f32 = 1e-10;
+
+/// PSNR in dB from a mean squared error between images in `[0, 1]`.
+pub fn psnr_from_mse(mse: Tensor<1>) -> Tensor<1> {
+    mse.clamp_min(PSNR_MIN_MSE).recip().log() * (10.0 / std::f32::consts::LN_10)
+}
+
+/// PSNR in dB between two `[H, W, 3]` images in `[0, 1]`.
+pub fn psnr(a: Tensor<3>, b: Tensor<3>) -> Tensor<1> {
+    psnr_from_mse((a - b).powi_scalar(2).mean())
 }
 
 /// Decode `gt_packed` back to a `[H, W, 3]` f32 RGB tensor. `composite_bg =
@@ -1124,7 +1155,9 @@ pub fn image_loss_eval(
 /// this is reserved for the LPIPS path which feeds f32 RGB into a VGG
 /// forward and has no kernel-fused alternative today.
 pub fn unpack_gt_rgb(gt_packed: Tensor<2, Int>, composite_bg: Option<Vec3>) -> Tensor<3> {
-    let gt_p = unwrap_wgpu_int(gt_packed);
-    let out = <MainBackend as LossOps<MainBackend>>::unpack_gt_rgb(gt_p, composite_bg);
-    wrap_wgpu_float(out)
+    let out = <burn::backend::Dispatch as LossOps>::unpack_gt_rgb(
+        gt_packed.into_dispatch(),
+        composite_bg,
+    );
+    Tensor::from_dispatch(out)
 }

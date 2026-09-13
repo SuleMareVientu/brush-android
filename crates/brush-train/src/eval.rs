@@ -2,8 +2,8 @@
 use std::path::Path;
 
 use anyhow::Result;
-use brush_dataset::scene::{sample_to_packed_data, view_to_sample_image};
-use brush_loss::{ImageLossConfig, image_loss_eval};
+use brush_dataset::scene::view_to_packed_data;
+use brush_loss::{ImageLossConfig, image_loss_eval, psnr_from_mse};
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, RenderAux, TextureMode, render_splats};
@@ -28,8 +28,7 @@ pub async fn eval_stats(
 ) -> Result<EvalSample> {
     let res = glam::uvec2(gt_img.width(), gt_img.height());
 
-    let (gt_packed_data, _has_alpha) =
-        sample_to_packed_data(view_to_sample_image(gt_img.clone(), alpha_mode));
+    let (gt_packed_data, _has_alpha) = view_to_packed_data(gt_img.clone(), alpha_mode);
     let gt_packed: Tensor<2, Int> = Tensor::from_data(gt_packed_data, device);
 
     // Render on reference black background.
@@ -50,7 +49,7 @@ pub async fn eval_stats(
     let mse = image_loss_eval(render_rgb.clone(), gt_packed.clone(), cfg(1.0, 0.0))
         .powi_scalar(2)
         .mean();
-    let psnr = mse.recip().log() * 10.0 / std::f32::consts::LN_10;
+    let psnr = psnr_from_mse(mse);
     let ssim = image_loss_eval(render_rgb.clone(), gt_packed, cfg(0.0, 1.0)).mean();
 
     Ok(EvalSample {
@@ -69,7 +68,7 @@ impl EvalSample {
         log::info!("Saving eval image to disk.");
         let img = self.rendered.clone();
         let [h, w, _] = [img.dims()[0], img.dims()[1], img.dims()[2]];
-        let data = img.clone().into_data_async().await?.into_vec::<f32>()?;
+        let data = img.clone().into_data_async().await?.try_into_vec::<f32>()?;
         let img: image::DynamicImage = Rgb32FImage::from_raw(w as u32, h as u32, data)
             .expect("Failed to create image from tensor")
             .into();

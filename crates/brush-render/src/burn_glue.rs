@@ -2,25 +2,25 @@
 
 use brush_cube::{MainBackend, MainBackendBase};
 use burn::backend::{
-    Autodiff, AutodiffBackend, BackendTensor, CheckpointingStrategy, DispatchTensor,
-    DispatchTensorKind, TensorMetadata,
+    Autodiff, BackendTensor, DispatchAutodiffContext, DispatchTensor, DispatchTensorKind,
+    GradientCheckpointingStrategy, TensorMetadata,
     tensor::{FloatTensor, IntTensor},
 };
 use burn::tensor::{DType, Int, Tensor};
 use burn_cubecl::fusion::FusionCubeRuntime;
 use burn_cubecl::tensor::CubeTensor;
 use burn_fusion::{
-    Fusion, FusionHandle,
+    ExecutionError, Fusion, FusionHandle,
     stream::{Operation, StreamId},
 };
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
-use burn_wgpu::WgpuRuntime;
 use glam::Vec3;
 
 use crate::{
-    RenderAuxInner, SplatOps, camera::Camera, gaussian_splats::SplatRenderMode,
-    render_aux::RenderOutput, wgpu_kind,
+    RenderAuxInner, SplatOps, backend_kind, camera::Camera, gaussian_splats::SplatRenderMode,
+    render_aux::RenderOutput,
 };
+use burn_cubecl::CubeBackend;
 
 /// Inner Wgpu autodiff backend (same as `Autodiff<burn::backend::Wgpu>`).
 /// Used as the primitive backend for autodiff `Tensor<D>` operations.
@@ -30,7 +30,7 @@ pub type AutodiffMain = Autodiff<MainBackend>;
 // `Tensor<D>` ↔ backend-level primitive bridges.
 //
 // `Tensor<D>` is pinned to burn's `Dispatch` backend; brush only ever runs on
-// a wgpu device, so every helper here assumes a `DispatchTensorKind::Wgpu`
+// a wgpu device, so every helper here assumes a `DispatchTensorKind::Cube`
 // (optionally wrapped in `Autodiff`) and panics otherwise. The forward render
 // now goes through the `#[backend_extension]`-generated `Dispatch` impl
 // instead; these stay for the hand-rolled backward path (brush-render-bwd)
@@ -42,7 +42,7 @@ pub type AutodiffMain = Autodiff<MainBackend>;
 pub fn unwrap_wgpu_float<const D: usize>(t: Tensor<D>) -> FloatTensor<MainBackend> {
     let dispatch: DispatchTensor = t.into_dispatch();
     match dispatch.kind {
-        wgpu_kind!(bt) => bt.float(),
+        backend_kind!(bt) => bt.float(),
         other => panic!(
             "expected Wgpu tensor, got: {:?}",
             std::mem::discriminant(&other)
@@ -55,7 +55,7 @@ pub fn unwrap_wgpu_float<const D: usize>(t: Tensor<D>) -> FloatTensor<MainBacken
 pub fn unwrap_wgpu_int<const D: usize>(t: Tensor<D, Int>) -> IntTensor<MainBackend> {
     let dispatch: DispatchTensor = t.into_dispatch();
     match dispatch.kind {
-        wgpu_kind!(bt) => bt.int(),
+        backend_kind!(bt) => bt.int(),
         other => panic!(
             "expected Wgpu int tensor, got: {:?}",
             std::mem::discriminant(&other)
@@ -67,16 +67,8 @@ pub fn unwrap_wgpu_int<const D: usize>(t: Tensor<D, Int>) -> IntTensor<MainBacke
 /// user-facing `Tensor<D>`.
 pub fn wrap_wgpu_float<const D: usize>(t: FloatTensor<MainBackend>) -> Tensor<D> {
     Tensor::from_dispatch(DispatchTensor {
-        kind: wgpu_kind!(BackendTensor::Float(t)),
-        checkpointing: None,
-    })
-}
-
-/// Like [`wrap_wgpu_float`] for an int tensor.
-pub fn wrap_wgpu_int<const D: usize>(t: IntTensor<MainBackend>) -> Tensor<D, Int> {
-    Tensor::from_dispatch(DispatchTensor {
-        kind: wgpu_kind!(BackendTensor::Int(t)),
-        checkpointing: None,
+        kind: backend_kind!(BackendTensor::Float(t)),
+        autodiff: DispatchAutodiffContext::Disabled,
     })
 }
 
@@ -86,7 +78,7 @@ pub fn unwrap_ad_wgpu_float<const D: usize>(t: Tensor<D>) -> FloatTensor<Autodif
     let prim: DispatchTensor = t.into_dispatch();
     match prim.kind {
         DispatchTensorKind::Autodiff(inner) => match *inner {
-            wgpu_kind!(BackendTensor::Autodiff(t)) => t,
+            backend_kind!(BackendTensor::Autodiff(t)) => t,
             other => panic!(
                 "autodiff inner kind is not Wgpu: {:?}",
                 std::mem::discriminant(&other)
@@ -108,7 +100,7 @@ pub fn unwrap_ad_wgpu_int<const D: usize>(t: Tensor<D, Int>) -> IntTensor<MainBa
         other => other,
     };
     match kind {
-        wgpu_kind!(bt) => bt.int(),
+        backend_kind!(bt) => bt.int(),
         other => panic!(
             "expected Wgpu int tensor; got: {:?}",
             std::mem::discriminant(&other)
@@ -120,51 +112,9 @@ pub fn unwrap_ad_wgpu_int<const D: usize>(t: Tensor<D, Int>) -> IntTensor<MainBa
 /// user-facing `Tensor<D>` on the autodiff device.
 pub fn wrap_ad_wgpu_float<const D: usize>(t: FloatTensor<AutodiffMain>) -> Tensor<D> {
     Tensor::from_dispatch(DispatchTensor {
-        kind: DispatchTensorKind::Autodiff(Box::new(wgpu_kind!(BackendTensor::Autodiff(t)))),
-        checkpointing: Some(CheckpointingStrategy::None),
+        kind: DispatchTensorKind::Autodiff(Box::new(backend_kind!(BackendTensor::Autodiff(t)))),
+        autodiff: DispatchAutodiffContext::Enabled(GradientCheckpointingStrategy::Disabled),
     })
-}
-
-/// Strip the autodiff wrapping from a `Tensor<D>` and clear the residual
-/// `checkpointing` field.
-///
-/// Operates directly on the `DispatchTensor` kind so it works both for an
-/// autodiff input (unwrap one level) and an already-inner input (passthrough),
-/// always landing with `checkpointing: None`. The high-level `.inner()` can't
-/// stand in here: it panics on a non-autodiff input, and (via the Bridge path)
-/// doesn't reliably normalise `checkpointing`, which downstream ops read as a
-/// "came from autodiff" signal and use to re-lift — tripping cross-backend
-/// asserts when mixed with a genuinely-inner tensor.
-pub fn detach_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
-    let dispatch: DispatchTensor = t.into_dispatch();
-    let kind = match dispatch.kind {
-        DispatchTensorKind::Autodiff(inner) => *inner,
-        other => other,
-    };
-    Tensor::from_dispatch(DispatchTensor {
-        kind,
-        checkpointing: None,
-    })
-}
-
-/// Lift a non-autodiff `Tensor<D>` into the autodiff graph as a constant.
-/// A no-op if `t` is already autodiff.
-///
-/// Lifts at the concrete-Wgpu autodiff level and re-wraps with an explicit
-/// `checkpointing`. The high-level `Tensor::from_inner` goes through the
-/// Bridge/Dispatch path, which doesn't set `checkpointing` the way the mixed
-/// inner/autodiff folds (e.g. `fold_min_scale`) need — a lifted constant then
-/// degrades to the inner backend on the next op and trips a cross-backend
-/// assert. Keep the hand-rolled lift.
-pub fn lift_to_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
-    let dispatch: DispatchTensor = t.into_dispatch();
-    match dispatch.kind {
-        wgpu_kind!(BackendTensor::Float(inner)) => {
-            wrap_ad_wgpu_float(<AutodiffMain as AutodiffBackend>::from_inner(inner))
-        }
-        DispatchTensorKind::Autodiff(_) => Tensor::from_dispatch(dispatch),
-        _ => panic!("expected Wgpu tensor to lift to autodiff"),
-    }
 }
 
 fn is_autodiff<const D: usize>(t: &Tensor<D>) -> bool {
@@ -178,46 +128,32 @@ fn is_autodiff<const D: usize>(t: &Tensor<D>) -> bool {
 /// keeps some frozen tensors (e.g. the 3D-filter floor) on the inner backend
 /// but folds them against params that may be lifted to autodiff; this aligns
 /// both operands so dispatch ops don't trip a cross-backend assertion.
-pub fn match_backend<const D: usize, const DR: usize>(
+pub(crate) fn match_backend<const D: usize, const DR: usize>(
     t: Tensor<D>,
     reference: &Tensor<DR>,
 ) -> Tensor<D> {
     if is_autodiff(reference) {
-        lift_to_autodiff(t)
+        t.autodiff()
     } else {
-        detach_autodiff(t)
+        t.without_autodiff()
     }
 }
 
-/// Like [`detach_autodiff`] for `Tensor<D, Int>`.
-pub fn detach_autodiff_int<const D: usize>(t: Tensor<D, Int>) -> Tensor<D, Int> {
-    let dispatch: DispatchTensor = t.into_dispatch();
-    let kind = match dispatch.kind {
-        DispatchTensorKind::Autodiff(inner) => *inner,
-        other => other,
-    };
-    Tensor::from_dispatch(DispatchTensor {
-        kind,
-        checkpointing: None,
-    })
-}
-
-/// Resolve a `Tensor<D>` on a Wgpu device down to the underlying
-/// `CubeTensor<WgpuRuntime>`, draining any pending fusion ops. Useful for
-/// direct GPU resource access (e.g. binding the buffer into a wgpu pipeline).
-pub fn resolve_to_cube_float<const D: usize>(tensor: Tensor<D>) -> CubeTensor<WgpuRuntime> {
+/// Resolve pending fusion operations and return the underlying tensor.
+pub fn resolve_to_cube_float<const D: usize>(tensor: Tensor<D>) -> CubeTensor {
     let fusion = unwrap_wgpu_float(tensor);
     let client = fusion.client.clone();
     client.resolve_tensor_float::<MainBackendBase>(fusion)
 }
 
-impl SplatOps for Fusion<MainBackendBase> {
+impl SplatOps for Fusion<CubeBackend> {
     async fn render(
         camera: &Camera,
         img_size: glam::UVec2,
         transforms: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
+        refine_weight: FloatTensor<Self>,
         render_mode: SplatRenderMode,
         background: Vec3,
         pass: crate::gaussian_splats::RasterPass,
@@ -228,21 +164,24 @@ impl SplatOps for Fusion<MainBackendBase> {
         // drains any pending fusion operations into a concrete buffer.
         let base_transforms = client
             .clone()
-            .resolve_tensor_float::<MainBackendBase>(transforms);
+            .resolve_tensor_float::<CubeBackend>(transforms);
         let base_sh_coeffs = client
             .clone()
-            .resolve_tensor_float::<MainBackendBase>(sh_coeffs);
+            .resolve_tensor_float::<CubeBackend>(sh_coeffs);
         let base_raw_opac = client
             .clone()
-            .resolve_tensor_float::<MainBackendBase>(raw_opacities);
+            .resolve_tensor_float::<CubeBackend>(raw_opacities);
+        let base_refine_weight = client
+            .clone()
+            .resolve_tensor_float::<CubeBackend>(refine_weight);
 
-        // Run the full pipeline on MainBackendBase.
-        let out = MainBackendBase::render(
+        let out = <CubeBackend as SplatOps>::render(
             camera,
             img_size,
             base_transforms,
             base_sh_coeffs,
             base_raw_opac,
+            base_refine_weight,
             render_mode,
             background,
             pass,
@@ -253,20 +192,20 @@ impl SplatOps for Fusion<MainBackendBase> {
         #[derive(Debug)]
         struct BindOp {
             desc: CustomOpIr,
-            out_img: FloatTensor<MainBackendBase>,
-            visible: FloatTensor<MainBackendBase>,
-            max_radius: FloatTensor<MainBackendBase>,
-            projected_splats: FloatTensor<MainBackendBase>,
-            tile_offsets: IntTensor<MainBackendBase>,
-            compact_gid_from_isect: IntTensor<MainBackendBase>,
-            global_from_compact_gid: IntTensor<MainBackendBase>,
+            out_img: FloatTensor<CubeBackend>,
+            visible: FloatTensor<CubeBackend>,
+            max_radius: FloatTensor<CubeBackend>,
+            projected_splats: FloatTensor<CubeBackend>,
+            tile_offsets: IntTensor<CubeBackend>,
+            compact_gid_from_isect: IntTensor<CubeBackend>,
+            global_from_compact_gid: IntTensor<CubeBackend>,
         }
 
-        impl Operation<FusionCubeRuntime<WgpuRuntime>> for BindOp {
+        impl Operation<FusionCubeRuntime> for BindOp {
             fn execute(
                 &self,
-                h: &mut HandleContainer<FusionHandle<FusionCubeRuntime<WgpuRuntime>>>,
-            ) {
+                h: &mut HandleContainer<FusionHandle<FusionCubeRuntime>>,
+            ) -> Result<(), ExecutionError> {
                 let (_, outputs) = self.desc.as_fixed::<0, 7>();
                 let [
                     out_img,
@@ -278,63 +217,36 @@ impl SplatOps for Fusion<MainBackendBase> {
                     global_from_compact_gid,
                 ] = outputs;
 
-                h.register_float_tensor::<MainBackendBase>(&out_img.id, self.out_img.clone());
-                h.register_float_tensor::<MainBackendBase>(&visible.id, self.visible.clone());
-                h.register_float_tensor::<MainBackendBase>(&max_radius.id, self.max_radius.clone());
-                h.register_float_tensor::<MainBackendBase>(
+                h.register_float_tensor::<CubeBackend>(&out_img.id, self.out_img.clone());
+                h.register_float_tensor::<CubeBackend>(&visible.id, self.visible.clone());
+                h.register_float_tensor::<CubeBackend>(&max_radius.id, self.max_radius.clone());
+                h.register_float_tensor::<CubeBackend>(
                     &projected_splats.id,
                     self.projected_splats.clone(),
                 );
-                h.register_int_tensor::<MainBackendBase>(
-                    &tile_offsets.id,
-                    self.tile_offsets.clone(),
-                );
-                h.register_int_tensor::<MainBackendBase>(
+                h.register_int_tensor::<CubeBackend>(&tile_offsets.id, self.tile_offsets.clone());
+                h.register_int_tensor::<CubeBackend>(
                     &compact_gid_from_isect.id,
                     self.compact_gid_from_isect.clone(),
                 );
-                h.register_int_tensor::<MainBackendBase>(
+                h.register_int_tensor::<CubeBackend>(
                     &global_from_compact_gid.id,
                     self.global_from_compact_gid.clone(),
                 );
+                Ok(())
             }
         }
 
-        let out_img_ir = TensorIr::uninit(
-            client.create_empty_handle(),
-            out.out_img.shape(),
-            DType::F32,
-        );
-        let visible_ir = TensorIr::uninit(
-            client.create_empty_handle(),
-            out.aux.visible.shape(),
-            DType::F32,
-        );
-        let max_radius_ir = TensorIr::uninit(
-            client.create_empty_handle(),
-            out.aux.max_radius.shape(),
-            DType::F32,
-        );
-        let projected_splats_ir = TensorIr::uninit(
-            client.create_empty_handle(),
-            out.projected_splats.shape(),
-            DType::F32,
-        );
-        let tile_offsets_ir = TensorIr::uninit(
-            client.create_empty_handle(),
-            out.aux.tile_offsets.shape(),
-            DType::U32,
-        );
-        let compact_gid_from_isect_ir = TensorIr::uninit(
-            client.create_empty_handle(),
-            out.compact_gid_from_isect.shape(),
-            DType::U32,
-        );
-        let global_from_compact_gid_ir = TensorIr::uninit(
-            client.create_empty_handle(),
-            out.global_from_compact_gid.shape(),
-            DType::U32,
-        );
+        // Every output is a fresh handle the bind op fills in; only shape and
+        // dtype differ.
+        let new_out = |shape, dtype| TensorIr::uninit(client.create_empty_handle(), shape, dtype);
+        let out_img_ir = new_out(out.out_img.shape(), DType::F32);
+        let visible_ir = new_out(out.aux.visible.shape(), DType::F32);
+        let max_radius_ir = new_out(out.aux.max_radius.shape(), DType::F32);
+        let projected_splats_ir = new_out(out.projected_splats.shape(), DType::F32);
+        let tile_offsets_ir = new_out(out.aux.tile_offsets.shape(), DType::U32);
+        let compact_gid_from_isect_ir = new_out(out.compact_gid_from_isect.shape(), DType::U32);
+        let global_from_compact_gid_ir = new_out(out.global_from_compact_gid.shape(), DType::U32);
 
         let stream = StreamId::current();
         let desc = CustomOpIr::new(
